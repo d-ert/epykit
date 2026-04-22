@@ -1,0 +1,34 @@
+# py-methyl-toolkit Snakemake pipeline configuration
+# ====================================================
+# Edit these values for your experiment.
+
+# --- Input ---
+sample_sheet: "sample_sheet.csv"     # path to your sample sheet CSV
+                                     # Required columns: sample_id, path, group
+                                     # Optional: batch, age, sex, ...
+
+# --- Reference genome ---
+genome: "hg38"                       # used for annotation only (not alignment)
+
+# --- Coverage thresholds ---
+min_coverage: 5                      # discard sites with coverage < min
+max_coverage: 500                    # discard sites with coverage > max (PCR dedup filter)
+
+# --- Methylation context ---
+context: "CpG"                       # CpG | CHG | CHH
+
+# --- Differential methylation ---
+treatment_col: "group"               # obs column that defines groups (must have exactly 2)
+test: "auto"                         # auto | fisher | glm
+overdispersion: true                 # apply HC0 quasi-binomial correction
+fdr_method: "BH"                     # BH (Benjamini-Hochberg) | bonferroni
+
+# --- Tiling windows ---
+tile_window: 1000                    # window size in bp
+tile_step: 1000                      # step size in bp (= window for non-overlapping)
+
+# --- DMR merging ---
+dmr_max_gap: 1000                    # max distance between adjacent DMCs to merge (bp)
+dmr_min_sites: 3                     # minimum CpG sites per DMR
+dmr_min_abs_diff: 10.0               # minimum absolute methylation difference (%)
+dmr_qvalue_cutoff: 0.05              # q-value threshold for DMCs included in merging

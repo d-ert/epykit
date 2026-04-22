@@ -1,0 +1,178 @@
+"""
+Snakemake workflow for py-methyl-toolkit
+==========================================
+Full pipeline: Bismark alignment outputs → differential methylation → DMR output.
+
+Usage
+-----
+    snakemake --cores 8 --use-conda
+
+Configure
+---------
+Edit ``config/config.yaml`` to set:
+  - sample_sheet: path to CSV sample sheet
+  - genome: reference genome (hg38 / mm10 / etc.)
+  - min_coverage: minimum read coverage per site
+  - context: CpG / CHG / CHH
+
+Input requirements
+------------------
+Each sample in the sample sheet must have a pre-computed Bismark
+coverage file:  ``{sample_id}.bismark.cov.gz``
+
+Output files
+------------
+  results/
+    anndata/cohort.h5ad          — cohort AnnData
+    dmc/diff_meth.tsv            — per-site p-values and effect sizes
+    dmr/diff_meth_regions.bed    — merged DMRs (BED format)
+    dmr/diff_meth_regions.tsv    — annotated DMR table
+    qc/pca.png                   — PCA plot
+    qc/correlation_heatmap.png   — sample correlation heatmap
+    qc/coverage_summary.tsv      — per-sample coverage stats
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+configfile: "config/config.yaml"
+
+SAMPLE_SHEET = config.get("sample_sheet", "sample_sheet.csv")
+MIN_COVERAGE = config.get("min_coverage", 5)
+MAX_COVERAGE = config.get("max_coverage", 500)
+CONTEXT      = config.get("context", "CpG")
+TREATMENT_COL = config.get("treatment_col", "group")
+TEST          = config.get("test", "auto")
+OVERDISPERSION = config.get("overdispersion", True)
+FDR_METHOD    = config.get("fdr_method", "BH")
+TILE_WINDOW   = config.get("tile_window", 1000)
+TILE_STEP     = config.get("tile_step", 1000)
+DMR_MAX_GAP   = config.get("dmr_max_gap", 1000)
+DMR_MIN_SITES = config.get("dmr_min_sites", 3)
+
+
+# ---------------------------------------------------------------------------
+# Global target
+# ---------------------------------------------------------------------------
+
+rule all:
+    input:
+        "results/anndata/cohort.h5ad",
+        "results/dmc/diff_meth.tsv",
+        "results/dmr/diff_meth_regions.bed",
+        "results/qc/pca.png",
+        "results/qc/correlation_heatmap.png",
+        "results/qc/coverage_summary.tsv",
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Load samples and build cohort AnnData
+# ---------------------------------------------------------------------------
+
+rule load_samples:
+    input:
+        sample_sheet = SAMPLE_SHEET,
+    output:
+        anndata = "results/anndata/cohort.h5ad",
+        coverage_stats = "results/qc/coverage_summary.tsv",
+    params:
+        min_coverage = MIN_COVERAGE,
+        max_coverage = MAX_COVERAGE,
+        context      = CONTEXT,
+    log:
+        "logs/load_samples.log",
+    conda:
+        "envs/pymethyl.yaml"
+    script:
+        "scripts/load_samples.py"
+
+
+# ---------------------------------------------------------------------------
+# Step 2: QC plots
+# ---------------------------------------------------------------------------
+
+rule qc_plots:
+    input:
+        anndata = "results/anndata/cohort.h5ad",
+    output:
+        pca_plot   = "results/qc/pca.png",
+        corr_plot  = "results/qc/correlation_heatmap.png",
+    params:
+        treatment_col = TREATMENT_COL,
+    log:
+        "logs/qc_plots.log",
+    conda:
+        "envs/pymethyl.yaml"
+    script:
+        "scripts/qc_plots.py"
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Differential methylation analysis
+# ---------------------------------------------------------------------------
+
+rule diff_meth:
+    input:
+        anndata = "results/anndata/cohort.h5ad",
+    output:
+        dmc_tsv = "results/dmc/diff_meth.tsv",
+    params:
+        treatment_col  = TREATMENT_COL,
+        test           = TEST,
+        overdispersion = OVERDISPERSION,
+        fdr_method     = FDR_METHOD,
+        min_coverage   = MIN_COVERAGE,
+    log:
+        "logs/diff_meth.log",
+    conda:
+        "envs/pymethyl.yaml"
+    script:
+        "scripts/diff_meth.py"
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Tile analysis (optional, comment out if not needed)
+# ---------------------------------------------------------------------------
+
+rule tile_diff_meth:
+    input:
+        anndata = "results/anndata/cohort.h5ad",
+    output:
+        tiled_anndata = "results/anndata/cohort_tiled.h5ad",
+        tiled_dmc     = "results/dmc/diff_meth_tiled.tsv",
+    params:
+        window        = TILE_WINDOW,
+        step          = TILE_STEP,
+        treatment_col = TREATMENT_COL,
+    log:
+        "logs/tile_diff_meth.log",
+    conda:
+        "envs/pymethyl.yaml"
+    script:
+        "scripts/tile_diff_meth.py"
+
+
+# ---------------------------------------------------------------------------
+# Step 5: DMR merging
+# ---------------------------------------------------------------------------
+
+rule merge_dmrs:
+    input:
+        dmc_tsv = "results/dmc/diff_meth.tsv",
+    output:
+        dmr_bed = "results/dmr/diff_meth_regions.bed",
+        dmr_tsv = "results/dmr/diff_meth_regions.tsv",
+    params:
+        max_gap   = DMR_MAX_GAP,
+        min_sites = DMR_MIN_SITES,
+    log:
+        "logs/merge_dmrs.log",
+    conda:
+        "envs/pymethyl.yaml"
+    script:
+        "scripts/merge_dmrs.py"

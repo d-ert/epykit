@@ -1,0 +1,97 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "py-methyl-toolkit"
+dynamic = ["version"]
+description = "A highly scalable Python framework for WGBS/bisulfite sequencing data analysis, interval algebra, and differential methylation modeling."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "py-methyl-toolkit contributors" }
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "polars>=0.19.0",
+    "anndata>=0.9.0",
+    "statsmodels>=0.14.0",
+    "pyarrow>=14.0.0",
+    "scanpy>=1.9.0",
+    "seaborn>=0.12.0",
+    "matplotlib>=3.7.0",
+    "pandas>=2.0.0",
+]
+
+[project.optional-dependencies]
+bio = [
+    "polars-bio>=0.2.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4.0",
+    "mypy>=1.0",
+    "pre-commit>=3.0",
+    "hatch",
+]
+all = [
+    "py-methyl-toolkit[bio,dev]"
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/py-methyl-toolkit"
+Documentation = "https://py-methyl-toolkit.readthedocs.io"
+"Bug Tracker" = "https://github.com/your-org/py-methyl-toolkit/issues"
+
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.1.0"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pymethyl"]
+
+[tool.uv]
+managed = true
+
+# --- Ruff linting & formatting ---
+[tool.ruff]
+src = ["src"]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pymethyl"]
+
+# --- Mypy type checking ---
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+# --- Pytest ---
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=pymethyl --cov-report=term-missing -v"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::FutureWarning",
+]

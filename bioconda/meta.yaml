@@ -1,0 +1,79 @@
+{% set name = "py-methyl-toolkit" %}
+{% set version = "0.1.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  url: https://pypi.io/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
+  # sha256 will be filled in when releasing to PyPI
+  # sha256: <SHA256_FROM_PYPI>
+
+build:
+  noarch: python
+  number: 0
+  script: {{ PYTHON }} -m pip install . -vv
+
+requirements:
+  host:
+    - python >=3.9
+    - pip
+    - hatchling
+    - hatch-vcs
+  run:
+    - python >=3.9
+    - numpy >=1.24.0
+    - scipy >=1.10.0
+    - polars >=0.19.0
+    - anndata >=0.9.0
+    - statsmodels >=0.14.0
+    - pyarrow >=14.0.0
+    - scanpy >=1.9.0
+    - seaborn >=0.12.0
+    - matplotlib-base >=3.7.0
+    - pandas >=2.0.0
+
+test:
+  imports:
+    - pymethyl
+    - pymethyl.io
+    - pymethyl.core
+    - pymethyl.intervals
+    - pymethyl.stats
+    - pymethyl.plot
+  commands:
+    - python -c "import pymethyl; print(pymethyl.__version__)"
+  requires:
+    - pytest
+    - pytest-cov
+
+about:
+  home: https://github.com/your-org/py-methyl-toolkit
+  summary: >-
+    A highly scalable Python framework for WGBS/bisulfite sequencing data
+    analysis, interval algebra, and differential methylation modeling.
+  description: |
+    py-methyl-toolkit is a production-grade Python alternative to R's methylKit,
+    built on Polars (Rust-powered tabular processing), AnnData (Zarr/HDF5
+    cloud-native storage), polars-bio (genomic interval algebra), and
+    statsmodels (Binomial GLM + LRT + HC0 overdispersion correction).
+
+    Key features:
+    - Bismark coverage reader with Polars lazy scan and predicate pushdown
+    - Multi-sample cohort loading with parallel ingestion
+    - AnnData-based matrix storage (samples × sites, Zarr/HDF5)
+    - MethylData class with filter_coverage, subset_context, unite
+    - Genomic tiling windows and feature annotation (polars-bio)
+    - Fisher exact, Logistic GLM+LRT, HC0 overdispersion correction
+    - BH-FDR multiple testing + distance-based DMR merging
+    - PCA, UMAP, batch detection (assoc_comp), correlation heatmaps
+  license: MIT
+  license_family: MIT
+  license_file: LICENSE
+  doc_url: https://py-methyl-toolkit.readthedocs.io
+  dev_url: https://github.com/your-org/py-methyl-toolkit
+
+extra:
+  recipe-maintainers:
+    - your-github-username
