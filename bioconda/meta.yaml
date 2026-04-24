@@ -1,4 +1,4 @@
-{% set name = "py-methyl-toolkit" %}
+{% set name = "EpyKit" %}
 {% set version = "0.1.0" %}
 
 package:
@@ -49,7 +49,7 @@ test:
     - pytest-cov
 
 about:
-  home: https://github.com/your-org/py-methyl-toolkit
+  home: https://github.com/your-org/EpyKit
   summary: >-
     A highly scalable Python framework for WGBS/bisulfite sequencing data
     analysis, interval algebra, and differential methylation modeling.

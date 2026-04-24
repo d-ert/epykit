@@ -19,6 +19,7 @@ Usage
 """
 
 from pymethyl.io.anndata_builder import build_anndata, load, save
+from pymethyl.io.anndata_builder_chunked import build_anndata_chunked
 from pymethyl.io.bismark import read_bismark_coverage, read_bismark_cx_report
 from pymethyl.io.generic import read_bedgraph, read_generic_methylation
 from pymethyl.io.sample_sheet import read_samples
@@ -34,6 +35,7 @@ __all__ = [
     "read_samples",
     # AnnData construction & persistence
     "build_anndata",
+    "build_anndata_chunked",
     "save",
     "load",
 ]

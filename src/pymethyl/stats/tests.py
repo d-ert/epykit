@@ -137,7 +137,7 @@ def calculate_diff_meth(
             f"{list(mdata.samples.columns)}"
         )
 
-    groups = mdata.samples[treatment_col].unique().dropna().tolist()
+    groups = mdata.samples[treatment_col].dropna().unique().tolist()
     if len(groups) != 2:
         raise ValueError(
             f"treatment_col must have exactly 2 groups, found: {groups}"

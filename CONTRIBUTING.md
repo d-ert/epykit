@@ -1,4 +1,4 @@
-# Contributing to py-methyl-toolkit
+# Contributing to EpyKit
 
 Thank you for your interest in contributing! This guide covers the development
 setup, coding conventions, and the process for submitting pull requests.
@@ -16,8 +16,8 @@ setup, coding conventions, and the process for submitting pull requests.
 ### 2. Clone & install
 
 ```bash
-git clone https://github.com/your-org/py-methyl-toolkit.git
-cd py-methyl-toolkit
+git clone https://github.com/your-org/EpyKit.git
+cd EpyKit
 
 # Install in editable mode with all dev dependencies
 uv pip install -e ".[dev]"
@@ -61,7 +61,7 @@ for speed. All fixtures are session-scoped where possible.
 ## Project Structure
 
 ```
-py-methyl-toolkit/
+EpyKit/
 ├── src/pymethyl/           # Package source (src/ layout)
 │   ├── io/                 # Data ingestion
 │   │   ├── bismark.py      # Bismark readers

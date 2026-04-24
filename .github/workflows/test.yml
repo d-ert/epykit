@@ -31,7 +31,7 @@ jobs:
         run: ruff format --check src/ tests/
 
       - name: Run mypy
-        run: mypy src/pymethyl/ --ignore-missing-imports
+        run: mypy src/epykit/ --ignore-missing-imports
 
   test:
     name: Tests (Python ${{ matrix.python-version }})
@@ -57,7 +57,7 @@ jobs:
         run: uv pip install -e ".[dev]" --system
 
       - name: Run tests with coverage
-        run: uv run pytest tests/ --cov=pymethyl --cov-report=xml -v
+        run: uv run pytest tests/ --cov=epykit --cov-report=xml -v
 
       - name: Upload coverage to Codecov
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'

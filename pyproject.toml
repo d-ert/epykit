@@ -3,14 +3,14 @@ requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
-name = "py-methyl-toolkit"
+name = "EpyKit"
 dynamic = ["version"]
 description = "A highly scalable Python framework for WGBS/bisulfite sequencing data analysis, interval algebra, and differential methylation modeling."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
 authors = [
-    { name = "py-methyl-toolkit contributors" }
+    { name = "EpyKit contributors" }
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -49,13 +49,13 @@ dev = [
     "hatch",
 ]
 all = [
-    "py-methyl-toolkit[bio,dev]"
+    "EpyKit[bio,dev]"
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/py-methyl-toolkit"
-Documentation = "https://py-methyl-toolkit.readthedocs.io"
-"Bug Tracker" = "https://github.com/your-org/py-methyl-toolkit/issues"
+Homepage = "https://github.com/your-org/EpyKit"
+Documentation = "https://EpyKit.readthedocs.io"
+"Bug Tracker" = "https://github.com/your-org/EpyKit/issues"
 
 [tool.hatch.version]
 source = "vcs"

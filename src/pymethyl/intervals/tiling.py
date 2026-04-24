@@ -250,16 +250,21 @@ def annotate_features(
     if not bed_file.exists():
         raise FileNotFoundError(f"BED file not found: {bed_file}")
 
-    # Read BED file
-    bed_cols = ["chr", "start", "end"]
+    # Read BED file — read without renaming first, then rename only what exists
     bed = pl.read_csv(
         str(bed_file),
         separator="\t",
         has_header=False,
         comment_prefix="#",
-        new_columns=bed_cols + [f"col_{i}" for i in range(3, 20)],
         infer_schema_length=50,
     )
+    # Rename first columns to canonical names (bed may have 3, 4, or more cols)
+    rename_map = {
+        bed.columns[0]: "chr",
+        bed.columns[1]: "start",
+        bed.columns[2]: "end",
+    }
+    bed = bed.rename(rename_map)
     # Keep only needed columns
     if bed.width > 3 and name_col is not None:
         n_col = f"col_{name_col}" if isinstance(name_col, int) else name_col
@@ -356,22 +361,26 @@ def annotate_cpg_islands(
     if not cpg_island_bed.exists():
         raise FileNotFoundError(f"CpG island BED file not found: {cpg_island_bed}")
 
-    islands = pl.read_csv(
+    islands_raw = pl.read_csv(
         str(cpg_island_bed),
         separator="\t",
         has_header=False,
         comment_prefix="#",
-        new_columns=["chr", "start", "end"] + [f"col_{i}" for i in range(3, 10)],
         infer_schema_length=50,
-    ).select(["chr", "start", "end"])
+    )
+    islands = islands_raw.rename({
+        islands_raw.columns[0]: "chr",
+        islands_raw.columns[1]: "start",
+        islands_raw.columns[2]: "end",
+    }).select(["chr", "start", "end"])
 
     # Create shore and shelf intervals by expanding the island intervals
     shores = islands.with_columns([
-        (pl.col("start") - shore_distance).clip_min(0).alias("start"),
+        (pl.col("start") - shore_distance).clip(lower_bound=0).alias("start"),
         (pl.col("end") + shore_distance).alias("end"),
     ])
     shelves = islands.with_columns([
-        (pl.col("start") - shelf_distance).clip_min(0).alias("start"),
+        (pl.col("start") - shelf_distance).clip(lower_bound=0).alias("start"),
         (pl.col("end") + shelf_distance).alias("end"),
     ])
 

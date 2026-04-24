@@ -1,4 +1,4 @@
-# py-methyl-toolkit 🧬
+# EpyKit 🧬
 
 A highly scalable, production-grade Python framework for **Whole Genome Bisulfite Sequencing (WGBS)** data analysis. Built as a modern Python alternative to R's `methylKit`, offering superior performance through Rust-powered data processing and cloud-native storage.
 
@@ -71,7 +71,7 @@ uv pip install -e ".[dev]"
 
 ### Using conda / Bioconda
 ```bash
-conda install -c bioconda -c conda-forge py-methyl-toolkit
+conda install -c bioconda -c conda-forge EpyKit
 ```
 
 ## Project Structure
@@ -111,7 +111,7 @@ This package is built on the **AnnData** specification:
 
 ## Comparison with methylKit
 
-| Feature | methylKit (R) | py-methyl-toolkit (Python) |
+| Feature | methylKit (R) | EpyKit (Python) |
 |---------|--------------|---------------------------|
 | Data backend | tabix flat files | AnnData + Zarr (lazy, cloud-native) |
 | Tabular engine | data.table | Polars (Rust, 10-100× faster) |
@@ -126,4 +126,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## License
 
-MIT License — see [LICENSE](LICENSE).
+MIT License — see [LICENSE].
