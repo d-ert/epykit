@@ -1,7 +1,7 @@
 """
 tests/test_core.py
 ==================
-Unit tests for pymethyl.core.MethylData.
+Unit tests for epykit.core.MethylData.
 """
 from __future__ import annotations
 
@@ -127,7 +127,7 @@ class TestUnite:
 
     def test_unite_removes_uncovered_sites(self, toy_adata):
         """Sites with 0 coverage in any sample should be removed."""
-        from pymethyl.core import MethylData
+        from epykit.core import MethylData
 
         adata_copy = toy_adata.copy()
         # Zero out coverage for first sample at first site
@@ -174,7 +174,7 @@ class TestMethylDataValidation:
 
     def test_missing_layers_raises(self, toy_adata):
         """AnnData without required layers should raise ValueError."""
-        from pymethyl.core import MethylData
+        from epykit.core import MethylData
 
         bad_adata = toy_adata.copy()
         del bad_adata.layers["coverage"]

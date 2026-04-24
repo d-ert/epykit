@@ -36,14 +36,14 @@ requirements:
 
 test:
   imports:
-    - pymethyl
-    - pymethyl.io
-    - pymethyl.core
-    - pymethyl.intervals
-    - pymethyl.stats
-    - pymethyl.plot
+    - epykit
+    - epykit.io
+    - epykit.core
+    - epykit.intervals
+    - epykit.stats
+    - epykit.plot
   commands:
-    - python -c "import pymethyl; print(pymethyl.__version__)"
+    - python -c "import epykit; print(epykit.__version__)"
   requires:
     - pytest
     - pytest-cov

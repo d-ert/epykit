@@ -72,7 +72,7 @@ def main() -> None:
     result_dir.mkdir(exist_ok=True)
     plot_dir.mkdir(exist_ok=True)
 
-    print("pymethyl imported \N{CHECK MARK}")
+    print("epykit imported \N{CHECK MARK}")
     print(f"Data    → {data_dir}")
     print(f"Results → {result_dir}")
     print(f"Plots   → {plot_dir}")

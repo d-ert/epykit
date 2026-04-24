@@ -16,24 +16,24 @@ A highly scalable, production-grade Python framework for **Whole Genome Bisulfit
 
 | Aligner | Format | Reader function |
 |---------|--------|----------------|
-| Bismark | `.bismark.cov.gz` / `.cov` | `pymethyl.io.read_bismark_coverage()` |
-| bwa-meth | bedGraph | `pymethyl.io.read_bedgraph()` *(coming soon)* |
-| Bismark | `CX_report` | `pymethyl.io.read_bismark_cx_report()` *(coming soon)* |
-| Generic | Tab-separated | `pymethyl.io.read_generic_methylation()` |
+| Bismark | `.bismark.cov.gz` / `.cov` | `epykit.io.read_bismark_coverage()` |
+| bwa-meth | bedGraph | `epykit.io.read_bedgraph()` *(coming soon)* |
+| Bismark | `CX_report` | `epykit.io.read_bismark_cx_report()` *(coming soon)* |
+| Generic | Tab-separated | `epykit.io.read_generic_methylation()` |
 
 ## Quick Start
 
 ```python
-import pymethyl
+import epykit
 
 # 1. Load a single Bismark coverage file
-df = pymethyl.io.read_bismark_coverage("sample1.bismark.cov.gz", min_coverage=5)
+df = epykit.io.read_bismark_coverage("sample1.bismark.cov.gz", min_coverage=5)
 
 # 2. Load multiple samples from a sample sheet
-adata = pymethyl.io.read_samples("sample_sheet.csv", min_coverage=5)
+adata = epykit.io.read_samples("sample_sheet.csv", min_coverage=5)
 
 # 3. Wrap in MethylData for ergonomic analysis
-mdata = pymethyl.core.MethylData(adata)
+mdata = epykit.core.MethylData(adata)
 
 # 4. Filter and subset
 mdata = mdata.filter_coverage(min_cov=5, max_cov=500)
@@ -41,10 +41,10 @@ mdata_cpg = mdata.subset_context("CpG")
 mdata_united = mdata_cpg.unite(type="intersect")
 
 # 5. Tiling windows
-tiled = pymethyl.intervals.tile_counts(mdata_united.adata, window=1000, step=1000)
+tiled = epykit.intervals.tile_counts(mdata_united.adata, window=1000, step=1000)
 
 # 6. Differential methylation
-results = pymethyl.stats.calculate_diff_meth(
+results = epykit.stats.calculate_diff_meth(
     mdata_united,
     treatment_col="group",
     test="auto",      # auto-selects Fisher or GLM based on replicates
@@ -53,8 +53,8 @@ results = pymethyl.stats.calculate_diff_meth(
 )
 
 # 7. QC plots
-pymethyl.plot.pca(mdata_united.adata)
-pymethyl.plot.sample_correlation(mdata_united.adata)
+epykit.plot.pca(mdata_united.adata)
+epykit.plot.sample_correlation(mdata_united.adata)
 ```
 
 ## Installation
@@ -77,7 +77,7 @@ conda install -c bioconda -c conda-forge EpyKit
 ## Project Structure
 
 ```
-src/pymethyl/
+src/epykit/
 ├── __init__.py          # Top-level exports
 ├── io/                  # Data ingestion (Bismark, bedGraph, sample sheets)
 │   ├── __init__.py

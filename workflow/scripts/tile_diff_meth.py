@@ -8,10 +8,10 @@ import sys
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-from pymethyl.core import MethylData
-from pymethyl.intervals import tile_counts
-from pymethyl.io import load, save
-from pymethyl.stats import calculate_diff_meth
+from epykit.core import MethylData
+from epykit.intervals import tile_counts
+from epykit.io import load, save
+from epykit.stats import calculate_diff_meth
 
 anndata_path  = snakemake.input.anndata          # noqa: F821
 out_tiled     = snakemake.output.tiled_anndata   # noqa: F821

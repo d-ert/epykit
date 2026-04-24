@@ -1,7 +1,7 @@
 """
 tests/test_intervals.py
 =======================
-Unit tests for pymethyl.intervals (tile_counts, annotate_features,
+Unit tests for epykit.intervals (tile_counts, annotate_features,
 annotate_cpg_islands).
 """
 from __future__ import annotations
@@ -87,23 +87,23 @@ def cpgi_bed(tmp_path: Path) -> Path:
 
 class TestTileCounts:
     def test_returns_anndata(self, small_adata):
-        from pymethyl.intervals.tiling import tile_counts
+        from epykit.intervals.tiling import tile_counts
         result = tile_counts(small_adata, window=5000)
         assert isinstance(result, ad.AnnData)
 
     def test_has_required_var_columns(self, small_adata):
-        from pymethyl.intervals.tiling import tile_counts
+        from epykit.intervals.tiling import tile_counts
         result = tile_counts(small_adata, window=5000)
         for col in ("chr", "start", "end"):
             assert col in result.var.columns, f"Missing var column: {col}"
 
     def test_obs_preserved(self, small_adata):
-        from pymethyl.intervals.tiling import tile_counts
+        from epykit.intervals.tiling import tile_counts
         result = tile_counts(small_adata, window=5000)
         assert result.n_obs == small_adata.n_obs
 
     def test_tile_window_size(self, small_adata):
-        from pymethyl.intervals.tiling import tile_counts
+        from epykit.intervals.tiling import tile_counts
         window = 2000
         result = tile_counts(small_adata, window=window)
         spans = result.var["end"] - result.var["start"]
@@ -112,29 +112,29 @@ class TestTileCounts:
         )
 
     def test_has_coverage_layer(self, small_adata):
-        from pymethyl.intervals.tiling import tile_counts
+        from epykit.intervals.tiling import tile_counts
         result = tile_counts(small_adata, window=5000)
         assert "coverage" in result.layers
 
     def test_has_methylated_counts_layer(self, small_adata):
-        from pymethyl.intervals.tiling import tile_counts
+        from epykit.intervals.tiling import tile_counts
         result = tile_counts(small_adata, window=5000)
         assert "methylated_counts" in result.layers
 
     def test_n_cpgs_column(self, small_adata):
-        from pymethyl.intervals.tiling import tile_counts
+        from epykit.intervals.tiling import tile_counts
         result = tile_counts(small_adata, window=5000)
         assert "n_cpgs" in result.var.columns
 
     def test_smaller_window_more_tiles(self, small_adata):
-        from pymethyl.intervals.tiling import tile_counts
+        from epykit.intervals.tiling import tile_counts
         small_w = tile_counts(small_adata, window=1000)
         large_w = tile_counts(small_adata, window=5000)
         assert small_w.n_vars >= large_w.n_vars
 
     def test_coverage_sum_conserved(self, small_adata):
         """Total coverage in tiles must equal total coverage in original."""
-        from pymethyl.intervals.tiling import tile_counts
+        from epykit.intervals.tiling import tile_counts
         result = tile_counts(small_adata, window=5000)
         orig_total = np.asarray(small_adata.layers["coverage"]).sum()
         tile_total = np.asarray(result.layers["coverage"]).sum()
@@ -147,23 +147,23 @@ class TestTileCounts:
 
 class TestAnnotateFeatures:
     def test_returns_anndata(self, small_adata, features_bed):
-        from pymethyl.intervals.tiling import annotate_features
+        from epykit.intervals.tiling import annotate_features
         result = annotate_features(small_adata, features_bed)
         assert isinstance(result, ad.AnnData)
 
     def test_n_vars_preserved(self, small_adata, features_bed):
-        from pymethyl.intervals.tiling import annotate_features
+        from epykit.intervals.tiling import annotate_features
         result = annotate_features(small_adata, features_bed)
         assert result.n_vars == small_adata.n_vars
 
     def test_feature_column_added(self, small_adata, features_bed):
-        from pymethyl.intervals.tiling import annotate_features
+        from epykit.intervals.tiling import annotate_features
         result = annotate_features(small_adata, features_bed, feature_col="feature")
         assert "feature" in result.var.columns
 
     def test_known_overlap(self, small_adata, features_bed):
         """chr1:1000 is inside gene_A (chr1:900-3500)."""
-        from pymethyl.intervals.tiling import annotate_features
+        from epykit.intervals.tiling import annotate_features
         result = annotate_features(small_adata, features_bed, feature_col="feature")
         # site chr1:1000-1001:* should have a non-None feature
         row = result.var[result.var["start"] == 1000]
@@ -174,7 +174,7 @@ class TestAnnotateFeatures:
 
     def test_no_overlap_is_none(self, tmp_path, small_adata):
         """Sites not overlapping any feature should be None."""
-        from pymethyl.intervals.tiling import annotate_features
+        from epykit.intervals.tiling import annotate_features
         # BED far from any site
         bed = tmp_path / "far.bed"
         bed.write_text("chrX\t999000\t999999\tgene_X\n")
@@ -184,13 +184,13 @@ class TestAnnotateFeatures:
         )
 
     def test_inplace_modifies_adata(self, small_adata, features_bed):
-        from pymethyl.intervals.tiling import annotate_features
+        from epykit.intervals.tiling import annotate_features
         result = annotate_features(small_adata, features_bed, inplace=True)
         assert result is small_adata
         assert "feature" in small_adata.var.columns
 
     def test_file_not_found_raises(self, small_adata, tmp_path):
-        from pymethyl.intervals.tiling import annotate_features
+        from epykit.intervals.tiling import annotate_features
         with pytest.raises(FileNotFoundError):
             annotate_features(small_adata, tmp_path / "missing.bed")
 
@@ -201,22 +201,22 @@ class TestAnnotateFeatures:
 
 class TestAnnotateCpGIslands:
     def test_returns_anndata(self, small_adata, cpgi_bed):
-        from pymethyl.intervals.tiling import annotate_cpg_islands
+        from epykit.intervals.tiling import annotate_cpg_islands
         result = annotate_cpg_islands(small_adata, cpgi_bed)
         assert isinstance(result, ad.AnnData)
 
     def test_n_vars_preserved(self, small_adata, cpgi_bed):
-        from pymethyl.intervals.tiling import annotate_cpg_islands
+        from epykit.intervals.tiling import annotate_cpg_islands
         result = annotate_cpg_islands(small_adata, cpgi_bed)
         assert result.n_vars == small_adata.n_vars
 
     def test_region_column_added(self, small_adata, cpgi_bed):
-        from pymethyl.intervals.tiling import annotate_cpg_islands
+        from epykit.intervals.tiling import annotate_cpg_islands
         result = annotate_cpg_islands(small_adata, cpgi_bed)
         assert "cpg_region" in result.var.columns
 
     def test_valid_region_values(self, small_adata, cpgi_bed):
-        from pymethyl.intervals.tiling import annotate_cpg_islands
+        from epykit.intervals.tiling import annotate_cpg_islands
         result = annotate_cpg_islands(small_adata, cpgi_bed)
         valid = {"island", "shore", "shelf", "open_sea"}
         for v in result.var["cpg_region"]:
@@ -224,7 +224,7 @@ class TestAnnotateCpGIslands:
 
     def test_known_island_site(self, small_adata, cpgi_bed):
         """chr1:1000 is inside CGI_1 (chr1:950-3200) → island."""
-        from pymethyl.intervals.tiling import annotate_cpg_islands
+        from epykit.intervals.tiling import annotate_cpg_islands
         result = annotate_cpg_islands(small_adata, cpgi_bed)
         row = result.var[result.var["start"] == 1000]
         assert row.iloc[0]["cpg_region"] == "island", (
@@ -238,7 +238,7 @@ class TestAnnotateCpGIslands:
             ("chr1", 1000, 1001),
             ("chr1", 11000, 11001),  # far from CGI_1 (ends at 3200+shelf)
         ])
-        from pymethyl.intervals.tiling import annotate_cpg_islands
+        from epykit.intervals.tiling import annotate_cpg_islands
         result = annotate_cpg_islands(extra, cpgi_bed)
         row = result.var[result.var["start"] == 11000]
         # with default shore=2000, shelf=4000: 3200+4000=7200 < 11000 → open_sea
@@ -247,6 +247,6 @@ class TestAnnotateCpGIslands:
         )
 
     def test_file_not_found_raises(self, small_adata, tmp_path):
-        from pymethyl.intervals.tiling import annotate_cpg_islands
+        from epykit.intervals.tiling import annotate_cpg_islands
         with pytest.raises(FileNotFoundError):
             annotate_cpg_islands(small_adata, tmp_path / "missing.bed")

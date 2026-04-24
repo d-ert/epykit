@@ -9,8 +9,8 @@ import sys
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
 import pandas as pd
-from pymethyl.stats import merge_dmrs
-from pymethyl.stats.dmr import dmrs_to_bed
+from epykit.stats import merge_dmrs
+from epykit.stats.dmr import dmrs_to_bed
 
 dmc_tsv   = snakemake.input.dmc_tsv     # noqa: F821
 out_bed   = snakemake.output.dmr_bed    # noqa: F821

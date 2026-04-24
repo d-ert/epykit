@@ -8,9 +8,9 @@ import sys
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-from pymethyl.core import MethylData
-from pymethyl.io import load
-from pymethyl.stats import calculate_diff_meth
+from epykit.core import MethylData
+from epykit.io import load
+from epykit.stats import calculate_diff_meth
 
 anndata_path   = snakemake.input.anndata         # noqa: F821
 out_tsv        = snakemake.output.dmc_tsv        # noqa: F821

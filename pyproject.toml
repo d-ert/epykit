@@ -62,7 +62,7 @@ source = "vcs"
 fallback-version = "0.1.0"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pymethyl"]
+packages = ["src/epykit"]
 
 [tool.uv]
 managed = true
@@ -78,7 +78,7 @@ select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
 ignore = ["E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["pymethyl"]
+known-first-party = ["epykit"]
 
 # --- Mypy type checking ---
 [tool.mypy]
@@ -90,7 +90,7 @@ ignore_missing_imports = true
 # --- Pytest ---
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=pymethyl --cov-report=term-missing -v"
+addopts = "--cov=epykit --cov-report=term-missing -v"
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::FutureWarning",

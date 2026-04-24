@@ -8,9 +8,9 @@ import sys
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-from pymethyl.core import MethylData
-from pymethyl.io import load
-from pymethyl import plot
+from epykit.core import MethylData
+from epykit.io import load
+from epykit import plot
 
 anndata_path  = snakemake.input.anndata         # noqa: F821
 out_pca       = snakemake.output.pca_plot       # noqa: F821

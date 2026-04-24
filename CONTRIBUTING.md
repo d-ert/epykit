@@ -44,7 +44,7 @@ commit hooks that run automatically on every `git commit`.
 uv run pytest
 
 # Run with coverage report
-uv run pytest --cov=pymethyl --cov-report=html
+uv run pytest --cov=epykit --cov-report=html
 
 # Run a specific module
 uv run pytest tests/test_io.py -v
@@ -62,7 +62,7 @@ for speed. All fixtures are session-scoped where possible.
 
 ```
 EpyKit/
-├── src/pymethyl/           # Package source (src/ layout)
+├── src/epykit/           # Package source (src/ layout)
 │   ├── io/                 # Data ingestion
 │   │   ├── bismark.py      # Bismark readers
 │   │   ├── generic.py      # bedGraph / generic readers
@@ -81,7 +81,7 @@ EpyKit/
 ├── workflow/               # Snakemake pipeline
 │   ├── Snakefile
 │   ├── config/config.yaml
-│   ├── envs/pymethyl.yaml
+│   ├── envs/epykit.yaml
 │   └── scripts/
 ├── bioconda/meta.yaml      # Bioconda recipe
 ├── pyproject.toml
@@ -100,7 +100,7 @@ EpyKit/
 ### Type Hints
 - All function signatures must be fully typed
 - Use `from __future__ import annotations` at the top of each file
-- Run `mypy src/pymethyl/` to verify
+- Run `mypy src/epykit/` to verify
 
 ### AnnData Geometry (Critical!)
 > ⚠️ AnnData stores **samples as rows** (obs) and **sites as columns** (var).
@@ -113,7 +113,7 @@ EpyKit/
 
 To add support for a new aligner (e.g., bwa-meth, BSMAP, BSBolt):
 
-1. **Add a reader** in `src/pymethyl/io/` (e.g., `bwameth.py`)
+1. **Add a reader** in `src/epykit/io/` (e.g., `bwameth.py`)
 2. **Normalise to the standard schema:**
    ```
    chr, start, end, strand, beta, methylated, unmethylated, coverage, context
@@ -156,7 +156,7 @@ LRT for quasi-likelihood models.
    ```bash
    ruff check src/ tests/
    ruff format src/ tests/
-   mypy src/pymethyl/
+   mypy src/epykit/
    ```
 4. Open a pull request against `main`. The CI will run tests on Python
    3.9, 3.10, 3.11, and 3.12 across Linux, macOS, and Windows.

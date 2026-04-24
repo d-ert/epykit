@@ -87,7 +87,7 @@ rule load_samples:
     log:
         "logs/load_samples.log",
     conda:
-        "envs/pymethyl.yaml"
+        "envs/epykit.yaml"
     script:
         "scripts/load_samples.py"
 
@@ -107,7 +107,7 @@ rule qc_plots:
     log:
         "logs/qc_plots.log",
     conda:
-        "envs/pymethyl.yaml"
+        "envs/epykit.yaml"
     script:
         "scripts/qc_plots.py"
 
@@ -130,7 +130,7 @@ rule diff_meth:
     log:
         "logs/diff_meth.log",
     conda:
-        "envs/pymethyl.yaml"
+        "envs/epykit.yaml"
     script:
         "scripts/diff_meth.py"
 
@@ -152,7 +152,7 @@ rule tile_diff_meth:
     log:
         "logs/tile_diff_meth.log",
     conda:
-        "envs/pymethyl.yaml"
+        "envs/epykit.yaml"
     script:
         "scripts/tile_diff_meth.py"
 
@@ -173,6 +173,6 @@ rule merge_dmrs:
     log:
         "logs/merge_dmrs.log",
     conda:
-        "envs/pymethyl.yaml"
+        "envs/epykit.yaml"
     script:
         "scripts/merge_dmrs.py"

@@ -1,7 +1,7 @@
 """
 tests/test_io.py
 ================
-Unit tests for the pymethyl.io data ingestion layer.
+Unit tests for the epykit.io data ingestion layer.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ class TestReadBismarkCoverage:
 
     def test_basic_read(self, bismark_cov_file):
         """Read a valid Bismark coverage file."""
-        from pymethyl.io import read_bismark_coverage
+        from epykit.io import read_bismark_coverage
 
         df = read_bismark_coverage(bismark_cov_file)
 
@@ -34,7 +34,7 @@ class TestReadBismarkCoverage:
 
     def test_min_coverage_filter(self, bismark_cov_file):
         """min_coverage filter should remove low-coverage sites."""
-        from pymethyl.io import read_bismark_coverage
+        from epykit.io import read_bismark_coverage
 
         df_all = read_bismark_coverage(bismark_cov_file, min_coverage=1)
         df_filtered = read_bismark_coverage(bismark_cov_file, min_coverage=30)
@@ -44,14 +44,14 @@ class TestReadBismarkCoverage:
 
     def test_max_coverage_filter(self, bismark_cov_file):
         """max_coverage filter should cap at upper limit."""
-        from pymethyl.io import read_bismark_coverage
+        from epykit.io import read_bismark_coverage
 
         df = read_bismark_coverage(bismark_cov_file, min_coverage=1, max_coverage=50)
         assert (df["coverage"] <= 50).all()
 
     def test_coverage_computed_correctly(self, bismark_cov_file):
         """Coverage = methylated + unmethylated."""
-        from pymethyl.io import read_bismark_coverage
+        from epykit.io import read_bismark_coverage
 
         df = read_bismark_coverage(bismark_cov_file)
         expected = df["methylated"] + df["unmethylated"]
@@ -59,7 +59,7 @@ class TestReadBismarkCoverage:
 
     def test_file_not_found_raises(self):
         """Non-existent file should raise FileNotFoundError."""
-        from pymethyl.io import read_bismark_coverage
+        from epykit.io import read_bismark_coverage
 
         with pytest.raises(FileNotFoundError):
             read_bismark_coverage("/nonexistent/path.bismark.cov")
@@ -67,7 +67,7 @@ class TestReadBismarkCoverage:
     def test_gzip_file(self, tmp_path):
         """Gzip-compressed files should be handled transparently."""
         import gzip
-        from pymethyl.io import read_bismark_coverage
+        from epykit.io import read_bismark_coverage
 
         content = b"chr1\t1000\t1001\t50.0\t25\t25\nchr1\t2000\t2001\t80.0\t40\t10\n"
         gz_file = tmp_path / "sample.bismark.cov.gz"
@@ -79,7 +79,7 @@ class TestReadBismarkCoverage:
 
     def test_beta_values_in_range(self, bismark_cov_file):
         """Beta values should be between 0 and 100."""
-        from pymethyl.io import read_bismark_coverage
+        from epykit.io import read_bismark_coverage
 
         df = read_bismark_coverage(bismark_cov_file)
         assert (df["beta"] >= 0).all()
@@ -87,7 +87,7 @@ class TestReadBismarkCoverage:
 
     def test_dtypes(self, bismark_cov_file):
         """Check column dtypes match expected schema."""
-        from pymethyl.io import read_bismark_coverage
+        from epykit.io import read_bismark_coverage
 
         df = read_bismark_coverage(bismark_cov_file)
         assert df["chr"].dtype == pl.Utf8
@@ -137,7 +137,7 @@ class TestReadSamples:
     def test_two_samples(self, sample_sheet_dir):
         """Should produce AnnData with 2 samples."""
         import anndata as ad
-        from pymethyl.io import read_samples
+        from epykit.io import read_samples
 
         sheet = sample_sheet_dir / "sample_sheet.csv"
         adata = read_samples(sheet, min_coverage=1)
@@ -148,7 +148,7 @@ class TestReadSamples:
 
     def test_obs_metadata_present(self, sample_sheet_dir):
         """Sample sheet metadata columns should appear in adata.obs."""
-        from pymethyl.io import read_samples
+        from epykit.io import read_samples
 
         sheet = sample_sheet_dir / "sample_sheet.csv"
         adata = read_samples(sheet)
@@ -158,7 +158,7 @@ class TestReadSamples:
 
     def test_sample_sheet_not_found_raises(self):
         """Non-existent sample sheet raises FileNotFoundError."""
-        from pymethyl.io import read_samples
+        from epykit.io import read_samples
 
         with pytest.raises(FileNotFoundError):
             read_samples("/nonexistent/sheet.csv")
@@ -170,7 +170,7 @@ class TestSavePersistence:
     def test_save_load_h5ad(self, toy_adata, tmp_path):
         """Round-trip through HDF5 should preserve data."""
         import numpy as np
-        from pymethyl.io import load, save
+        from epykit.io import load, save
 
         out_path = tmp_path / "test.h5ad"
         save(toy_adata, out_path, format="h5ad")
@@ -189,7 +189,7 @@ class TestSavePersistence:
     def test_save_load_zarr(self, toy_adata, tmp_path):
         """Round-trip through Zarr should preserve data."""
         import numpy as np
-        from pymethyl.io import load, save
+        from epykit.io import load, save
 
         out_path = tmp_path / "test.zarr"
         save(toy_adata, out_path, format="zarr")

@@ -105,7 +105,7 @@ def toy_adata() -> ad.AnnData:
 @pytest.fixture
 def toy_mdata(toy_adata):
     """Return a MethylData wrapper around the toy AnnData."""
-    from pymethyl.core import MethylData
+    from epykit.core import MethylData
     return MethylData(toy_adata.copy())
 
 

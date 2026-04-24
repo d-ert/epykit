@@ -1,7 +1,7 @@
 """
 tests/test_stats.py
 ===================
-Unit tests for the pymethyl.stats differential methylation engine.
+Unit tests for the epykit.stats differential methylation engine.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ class TestFisherExactTest:
 
     def test_output_shapes(self, toy_mdata):
         """fisher_exact_test should return arrays of shape (n_sites,)."""
-        from pymethyl.stats.tests import fisher_exact_test
+        from epykit.stats.tests import fisher_exact_test
 
         idx_a = np.array([True, True, False, False])
         idx_b = np.array([False, False, True, True])
@@ -29,7 +29,7 @@ class TestFisherExactTest:
 
     def test_pvalues_in_range(self, toy_mdata):
         """p-values must be in [0, 1]."""
-        from pymethyl.stats.tests import fisher_exact_test
+        from epykit.stats.tests import fisher_exact_test
 
         idx_a = np.array([True, True, False, False])
         idx_b = np.array([False, False, True, True])
@@ -42,7 +42,7 @@ class TestFisherExactTest:
 
     def test_known_differential_site(self, toy_mdata):
         """Sites 0-2 are highly differential in the fixture — p < 0.1."""
-        from pymethyl.stats.tests import fisher_exact_test
+        from epykit.stats.tests import fisher_exact_test
 
         idx_a = np.array([True, True, False, False])
         idx_b = np.array([False, False, True, True])
@@ -59,7 +59,7 @@ class TestCalculateDiffMeth:
 
     def test_returns_dataframe(self, toy_mdata):
         """Should return a pandas DataFrame."""
-        from pymethyl.stats import calculate_diff_meth
+        from epykit.stats import calculate_diff_meth
 
         result = calculate_diff_meth(
             toy_mdata, treatment_col="group", test="fisher"
@@ -68,7 +68,7 @@ class TestCalculateDiffMeth:
 
     def test_output_columns(self, toy_mdata):
         """Result should have required columns."""
-        from pymethyl.stats import calculate_diff_meth
+        from epykit.stats import calculate_diff_meth
 
         result = calculate_diff_meth(
             toy_mdata, treatment_col="group", test="fisher"
@@ -78,7 +78,7 @@ class TestCalculateDiffMeth:
 
     def test_row_count_equals_sites(self, toy_mdata):
         """One row per CpG site."""
-        from pymethyl.stats import calculate_diff_meth
+        from epykit.stats import calculate_diff_meth
 
         result = calculate_diff_meth(
             toy_mdata, treatment_col="group", test="fisher"
@@ -87,7 +87,7 @@ class TestCalculateDiffMeth:
 
     def test_sorted_by_pvalue(self, toy_mdata):
         """Results should be sorted by p-value ascending."""
-        from pymethyl.stats import calculate_diff_meth
+        from epykit.stats import calculate_diff_meth
 
         result = calculate_diff_meth(
             toy_mdata, treatment_col="group", test="fisher"
@@ -97,7 +97,7 @@ class TestCalculateDiffMeth:
 
     def test_qvalue_leq_pvalue(self, toy_mdata):
         """BH q-values should never exceed 1 and be non-negative."""
-        from pymethyl.stats import calculate_diff_meth
+        from epykit.stats import calculate_diff_meth
 
         result = calculate_diff_meth(
             toy_mdata, treatment_col="group", test="fisher"
@@ -107,7 +107,7 @@ class TestCalculateDiffMeth:
 
     def test_invalid_treatment_col_raises(self, toy_mdata):
         """Missing treatment_col should raise ValueError."""
-        from pymethyl.stats import calculate_diff_meth
+        from epykit.stats import calculate_diff_meth
 
         with pytest.raises(ValueError, match="treatment_col"):
             calculate_diff_meth(toy_mdata, treatment_col="nonexistent")
@@ -115,8 +115,8 @@ class TestCalculateDiffMeth:
     def test_auto_selects_fisher_for_single_replicates(self, toy_adata):
         """With 1 sample per group, auto should choose Fisher test."""
         import anndata as ad
-        from pymethyl.core import MethylData
-        from pymethyl.stats import calculate_diff_meth
+        from epykit.core import MethylData
+        from epykit.stats import calculate_diff_meth
 
         # Keep only 1 sample per group
         adata_sub = toy_adata[[0, 2], :].copy()
@@ -130,7 +130,7 @@ class TestCalculateDiffMeth:
 
     def test_glm_test_runs(self, toy_mdata):
         """GLM test should run and return valid p-values."""
-        from pymethyl.stats import calculate_diff_meth
+        from epykit.stats import calculate_diff_meth
 
         result = calculate_diff_meth(
             toy_mdata, treatment_col="group", test="glm", overdispersion=False
@@ -155,7 +155,7 @@ class TestMergeDMRs:
 
     def test_basic_merge(self):
         """Should merge consecutive significant sites into DMRs."""
-        from pymethyl.stats import merge_dmrs
+        from epykit.stats import merge_dmrs
 
         dmc = self._make_dmc_results()
         dmrs = merge_dmrs(dmc, qvalue_cutoff=0.05, min_sites=3, min_abs_diff=10.0)
@@ -165,7 +165,7 @@ class TestMergeDMRs:
 
     def test_output_columns(self):
         """DMR table should have required columns."""
-        from pymethyl.stats import merge_dmrs
+        from epykit.stats import merge_dmrs
 
         dmc = self._make_dmc_results()
         dmrs = merge_dmrs(dmc, qvalue_cutoff=0.05, min_sites=2, min_abs_diff=0.0)
@@ -175,7 +175,7 @@ class TestMergeDMRs:
 
     def test_direction_classification(self):
         """Positive mean_diff = hyper, negative = hypo."""
-        from pymethyl.stats import merge_dmrs
+        from epykit.stats import merge_dmrs
 
         dmc = self._make_dmc_results()
         dmrs = merge_dmrs(dmc, qvalue_cutoff=0.05, min_sites=2, min_abs_diff=0.0)
@@ -188,7 +188,7 @@ class TestMergeDMRs:
 
     def test_no_significant_sites(self):
         """When no sites pass qvalue_cutoff, returns empty DataFrame."""
-        from pymethyl.stats import merge_dmrs
+        from epykit.stats import merge_dmrs
 
         dmc = self._make_dmc_results()
         dmrs = merge_dmrs(dmc, qvalue_cutoff=0.001)
@@ -197,7 +197,7 @@ class TestMergeDMRs:
 
     def test_missing_columns_raises(self):
         """Missing required columns should raise ValueError."""
-        from pymethyl.stats import merge_dmrs
+        from epykit.stats import merge_dmrs
 
         bad_df = pd.DataFrame({"chr": ["chr1"], "start": [100]})
         with pytest.raises(ValueError, match="missing columns"):
@@ -205,7 +205,7 @@ class TestMergeDMRs:
 
     def test_min_sites_filter(self):
         """DMRs with fewer than min_sites should be excluded."""
-        from pymethyl.stats import merge_dmrs
+        from epykit.stats import merge_dmrs
 
         dmc = self._make_dmc_results()
         dmrs_strict = merge_dmrs(dmc, qvalue_cutoff=0.05, min_sites=10)
@@ -214,7 +214,7 @@ class TestMergeDMRs:
 
     def test_dmr_coordinates_valid(self):
         """DMR start should be <= end."""
-        from pymethyl.stats import merge_dmrs
+        from epykit.stats import merge_dmrs
 
         dmc = self._make_dmc_results()
         dmrs = merge_dmrs(dmc, qvalue_cutoff=0.05, min_sites=2, min_abs_diff=0.0)
@@ -228,7 +228,7 @@ class TestFDRCorrection:
 
     def test_bh_correction(self):
         """BH correction should return array of same length."""
-        from pymethyl.stats.tests import _apply_fdr
+        from epykit.stats.tests import _apply_fdr
 
         pvals = np.array([0.001, 0.01, 0.05, 0.1, 0.5, 1.0])
         qvals = _apply_fdr(pvals, method="BH")
@@ -239,7 +239,7 @@ class TestFDRCorrection:
 
     def test_qvalues_monotone(self):
         """BH q-values should be non-decreasing after sorting."""
-        from pymethyl.stats.tests import _apply_fdr
+        from epykit.stats.tests import _apply_fdr
 
         pvals = np.array([0.001, 0.005, 0.01, 0.05, 0.3, 0.9])
         qvals = _apply_fdr(pvals, method="BH")

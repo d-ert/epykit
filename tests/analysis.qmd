@@ -33,13 +33,13 @@ import matplotlib.pyplot as plt
 %matplotlib inline
 matplotlib.rcParams["figure.dpi"] = 120
 
-# pymethyl modules
-from pymethyl.io.bismark import read_bismark_coverage
-from pymethyl.io.anndata_builder import build_anndata, save, load
-from pymethyl.core.methyldata import MethylData
-from pymethyl.stats.tests import calculate_diff_meth
-from pymethyl.stats.dmr import merge_dmrs
-from pymethyl.plot import qc as qc_plots
+# epykit modules
+from epykit.io.bismark import read_bismark_coverage
+from epykit.io.anndata_builder import build_anndata, save, load
+from epykit.core.methyldata import MethylData
+from epykit.stats.tests import calculate_diff_meth
+from epykit.stats.dmr import merge_dmrs
+from epykit.plot import qc as qc_plots
 
 # Directories
 DATA_DIR = Path(".")  # folder containing this notebook / qmd
@@ -48,7 +48,7 @@ PLOT_DIR = Path("plots")
 RESULT_DIR.mkdir(exist_ok=True)
 PLOT_DIR.mkdir(exist_ok=True)
 
-print("pymethyl imported ✓")
+print("epykit imported ✓")
 print(f"Results → {RESULT_DIR.resolve()}")
 print(f"Plots   → {PLOT_DIR.resolve()}")
 ```

@@ -9,9 +9,9 @@ import sys
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
-import pymethyl
-from pymethyl.core import MethylData
-from pymethyl.io import read_samples, save
+import epykit
+from epykit.core import MethylData
+from epykit.io import read_samples, save
 
 # Snakemake-injected variables
 sample_sheet  = snakemake.input.sample_sheet        # noqa: F821

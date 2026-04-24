@@ -1,4 +1,4 @@
-name: pymethyl
+name: epykit
 channels:
   - conda-forge
   - bioconda
