@@ -17,8 +17,8 @@ A highly scalable, production-grade Python framework for **Whole Genome Bisulfit
 | Aligner | Format | Reader function |
 |---------|--------|----------------|
 | Bismark | `.bismark.cov.gz` / `.cov` | `epykit.io.read_bismark_coverage()` |
-| bwa-meth | bedGraph | `epykit.io.read_bedgraph()` *(coming soon)* |
-| Bismark | `CX_report` | `epykit.io.read_bismark_cx_report()` *(coming soon)* |
+| bwa-meth | bedGraph | `epykit.io.read_bedgraph()` |
+| Bismark | `CX_report` | `epykit.io.read_bismark_cx_report()` |
 | Generic | Tab-separated | `epykit.io.read_generic_methylation()` |
 
 ## Quick Start

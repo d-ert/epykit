@@ -53,9 +53,9 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/EpyKit"
+Homepage = "https://github.com/d-ert/epykit"
 Documentation = "https://EpyKit.readthedocs.io"
-"Bug Tracker" = "https://github.com/your-org/EpyKit/issues"
+"Bug Tracker" = "https://github.com/d-ert/epykit/issues"
 
 [tool.hatch.version]
 source = "vcs"

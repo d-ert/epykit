@@ -16,8 +16,8 @@ setup, coding conventions, and the process for submitting pull requests.
 ### 2. Clone & install
 
 ```bash
-git clone https://github.com/your-org/EpyKit.git
-cd EpyKit
+git clone https://github.com/d-ert/epykit.git
+cd epykit
 
 # Install in editable mode with all dev dependencies
 uv pip install -e ".[dev]"
@@ -61,7 +61,7 @@ for speed. All fixtures are session-scoped where possible.
 ## Project Structure
 
 ```
-EpyKit/
+epykit/
 ├── src/epykit/           # Package source (src/ layout)
 │   ├── io/                 # Data ingestion
 │   │   ├── bismark.py      # Bismark readers

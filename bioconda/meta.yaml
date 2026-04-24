@@ -49,7 +49,7 @@ test:
     - pytest-cov
 
 about:
-  home: https://github.com/your-org/EpyKit
+  home: https://github.com/d-ert/epykit
   summary: >-
     A highly scalable Python framework for WGBS/bisulfite sequencing data
     analysis, interval algebra, and differential methylation modeling.
@@ -71,9 +71,9 @@ about:
   license: MIT
   license_family: MIT
   license_file: LICENSE
-  doc_url: https://py-methyl-toolkit.readthedocs.io
-  dev_url: https://github.com/your-org/py-methyl-toolkit
+  doc_url: https://EpyKit.readthedocs.io
+  dev_url: https://github.com/d-ert/epykit
 
 extra:
   recipe-maintainers:
-    - your-github-username
+    - d-ert

@@ -1,6 +1,5 @@
-"""
-py-methyl-toolkit
-=================
+"""EpyKit
+======
 A highly scalable Python framework for Whole Genome Bisulfite Sequencing (WGBS)
 data analysis, interval algebra, and differential methylation modeling.
 
@@ -29,11 +28,16 @@ Example
 from importlib.metadata import PackageNotFoundError, version
 
 try:
-    __version__ = version("py-methyl-toolkit")
+    # Prefer the project/distribution name from pyproject.toml
+    __version__ = version("EpyKit")
 except PackageNotFoundError:  # pragma: no cover
-    __version__ = "0.0.0.dev0"
+    # Fallback to normalized name, and finally to a dev placeholder.
+    try:  # pragma: no cover
+        __version__ = version("epykit")
+    except PackageNotFoundError:  # pragma: no cover
+        __version__ = "0.0.0.dev0"
 
-__author__ = "py-methyl-toolkit contributors"
+__author__ = "EpyKit contributors"
 __license__ = "MIT"
 
 # Lazy sub-module imports — avoids importing heavy deps at top level

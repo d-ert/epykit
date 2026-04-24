@@ -1,19 +1,19 @@
 """End-to-end analysis demo script.
 
-This is a script version of ``test/analysis.ipynb``. It runs the same
+This is a script version of ``tests/analysis.ipynb``. It runs the same
 pipeline using the real Bismark ``.cov.gz`` files in this directory and
 produces QC plots and result tables.
 
 Run from the project root, e.g.::
 
-    python -m test.analysis
+    python -m tests.analysis
 
 or::
 
-    python test/analysis.py
+    python tests/analysis.py
 
 The script will create ``results/`` and ``plots/`` subdirectories next to
-this file (i.e. under ``test/``).
+this file (i.e. under ``tests/``).
 """
 
 from __future__ import annotations
@@ -32,7 +32,9 @@ from epykit.io.anndata_builder import build_anndata, save, load
 from epykit.core.methyldata import MethylData
 from epykit.stats.tests import calculate_diff_meth
 from epykit.stats.dmr import merge_dmrs
-from epykit.plot import qc as qc_plots
+# The public plotting API is exposed via epykit.plot (functions re-exported
+# from epykit.plot.qc).
+from epykit import plot as qc_plots
 
 
 logging.basicConfig(level=logging.INFO)
@@ -213,7 +215,7 @@ def main() -> None:
     min_cov = 1
     max_cov = 1000  # remove extreme outliers (PCR artefacts)
 
-    mdata_filt = mdata.filter_coverage(min_coverage=min_cov, max_coverage=max_cov)
+    mdata_filt = mdata.filter_coverage(min_cov=min_cov, max_cov=max_cov)
     print(f"Before filter : {mdata.n_sites:>10,} sites")
     print(f"After  filter : {mdata_filt.n_sites:>10,} sites")
     print(f"Retained      : {mdata_filt.n_sites / mdata.n_sites * 100:.1f} %")
@@ -236,7 +238,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 8 · Unite — keep only sites covered in ALL samples
     # ------------------------------------------------------------------
-    mdata_united = mdata_cpg.unite(how="intersect")
+    mdata_united = mdata_cpg.unite(type="intersect")
     print(f"Sites covered in ALL {mdata_united.n_samples} samples: {mdata_united.n_sites:,}")
 
     assert mdata_united.n_samples == mdata_cpg.n_samples
@@ -256,14 +258,14 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 10 · QC — PCA (coloured by group)
     # ------------------------------------------------------------------
-    fig = qc_plots.pca(mdata_united, color_by="group")
+    fig = qc_plots.pca(mdata_united.adata, color_by="group")
     fig.savefig(plot_dir / "03_pca.png", bbox_inches="tight")
     plt.close(fig)
 
     # ------------------------------------------------------------------
     # 11 · QC — sample-to-sample correlation heatmap
     # ------------------------------------------------------------------
-    fig = qc_plots.sample_correlation(mdata_united)
+    fig = qc_plots.sample_correlation(mdata_united.adata)
     fig.savefig(plot_dir / "04_sample_corr.png", bbox_inches="tight")
     plt.close(fig)
 
@@ -325,16 +327,16 @@ def main() -> None:
     # ------------------------------------------------------------------
     dmrs = merge_dmrs(
         results,
-        qvalue_col="qvalue",
         qvalue_cutoff=0.05,
-        diff_col="mean_diff",
+        max_gap=1000,
         min_sites=3,  # at least 3 CpGs per DMR
+        min_abs_diff=10.0,
     )
 
     print(f"DMRs found : {len(dmrs):,}")
     if len(dmrs):
         print("\nTop 10 DMRs by number of CpGs:")
-        print(dmrs.sort_values("n_sites", ascending=False).head(10))
+        print(dmrs.sort_values("n_cpgs", ascending=False).head(10))
 
     # Optional DMR summary
     if len(dmrs):
