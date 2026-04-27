@@ -1,3 +1,7 @@
 # Ignore coverage files
 *.cov.gz
 
+cohort.zarr/
+.tmp/
+.pytest_cache/
+**/__pycache__/

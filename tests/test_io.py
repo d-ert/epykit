@@ -177,6 +177,21 @@ class TestReadSamples:
         assert "coverage" in adata.layers
         assert "methylated_counts" in adata.layers
 
+    def test_duckdb_engine_does_not_polars_preload(self, sample_sheet_dir, monkeypatch):
+        """DuckDB engine should not call the Polars loader (_load_single_sample)."""
+        from epykit.io import read_samples
+        import epykit.io.sample_sheet as ss_mod
+
+        def _boom(*args, **kwargs):  # pragma: no cover
+            raise AssertionError("_load_single_sample() should not be called for engine='duckdb'")
+
+        monkeypatch.setattr(ss_mod, "_load_single_sample", _boom)
+
+        sheet = sample_sheet_dir / "sample_sheet.csv"
+        adata = read_samples(sheet, min_coverage=1, engine="duckdb")
+        assert adata.n_obs == 2
+        assert adata.n_vars > 0
+
     def test_duckdb_engine_var_names_int64(self, sample_sheet_dir):
         """DuckDB engine should have locus_id stored as int64 column."""
         from epykit.io import read_samples
@@ -199,6 +214,9 @@ class TestReadSamples:
         assert all(adata.var["locus_id"] >= 0)
         assert len(adata.var["locus_id"]) == adata.n_vars
 
+        # 4. var index name does not collide with the locus_id column name
+        assert adata.var.index.name != "locus_id"
+
     def test_duckdb_vs_polars_consistency(self, sample_sheet_dir):
         """DuckDB and Polars engines should produce same shape."""
         from epykit.io import read_samples
@@ -210,6 +228,27 @@ class TestReadSamples:
         # Shapes should match (same loci found)
         assert adata_polars.n_obs == adata_duckdb.n_obs
         assert adata_polars.n_vars == adata_duckdb.n_vars
+
+    def test_duckdb_engine_zarr_roundtrip(self, sample_sheet_dir, tmp_path):
+        """DuckDB + output='zarr' should write and reload successfully."""
+        import anndata as ad
+        from epykit.io import read_samples
+
+        sheet = sample_sheet_dir / "sample_sheet.csv"
+        out_dir = tmp_path / "cohort.zarr"
+
+        adata = read_samples(
+            sheet,
+            min_coverage=1,
+            engine="duckdb",
+            output="zarr",
+            out_path=out_dir,
+        )
+
+        assert out_dir.exists()
+        assert isinstance(adata, ad.AnnData)
+        assert adata.n_obs == 2
+        assert adata.n_vars > 0
 
 
 class TestSavePersistence:

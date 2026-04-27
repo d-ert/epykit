@@ -300,9 +300,9 @@ def build_anndata_streaming(
     for i, (sid, path) in enumerate(zip(sample_ids, file_paths)):
         logger.info("    [%d/%d] %s", i + 1, n_samples, sid)
 
-        # DuckDB LEFT JOINs the in-memory locus table against the file
-        # on disk.  The gzip is streamed by DuckDB's own I/O layer.
-        # fetchnumpy() returns {col: np.ndarray} — peak ~1.3 GB here.
+        # DuckDB INNER JOINs the locus table against the sample file on disk.
+        # Only loci present in the sample are returned (no NULLs/NaNs).
+        # fetchnumpy() peak RAM is proportional to sample coverage, not union size.
         result = con.execute(f"""
             SELECT
                 l.locus_idx,
@@ -310,24 +310,20 @@ def build_anndata_streaming(
                 CAST(s.methylated                    AS INTEGER)  AS methylated,
                 CAST(s.methylated + s.unmethylated   AS INTEGER)  AS coverage
             FROM _loci l
-            LEFT JOIN (
+            INNER JOIN (
                 {_read_sql(path, extra_cols="beta, methylated, unmethylated")}
             ) s ON l.chr = s.chr AND l.start = s.start
-            ORDER BY l.locus_idx
         """).fetchnumpy()
 
-        # Identify which loci this sample actually covered.
-        # LEFT JOIN misses have NULL beta, which fetchnumpy() encodes as NaN.
+        # Scatter covered loci into preallocated matrices.
+        # locus_idx tells us which rows in the output to fill.
         locus_idx = result["locus_idx"]
-        raw_beta  = result["beta"].astype(np.float32)
-        covered   = ~np.isnan(raw_beta)
+        beta_mat[i, locus_idx] = result["beta"].astype(np.float32)
+        meth_mat[i, locus_idx] = result["methylated"].astype(np.int32)
+        cov_mat[i, locus_idx]  = result["coverage"].astype(np.int32)
 
-        beta_mat[i, locus_idx[covered]] = raw_beta[covered]
-        meth_mat[i, locus_idx[covered]] = result["methylated"][covered].astype(np.int32)
-        cov_mat[i, locus_idx[covered]]  = result["coverage"][covered].astype(np.int32)
-
-        # Free the ~1.3 GB intermediate result before the next sample.
-        del result, raw_beta, locus_idx, covered
+        # Free the intermediate result before the next sample.
+        del result, locus_idx
         gc.collect()
 
     # ------------------------------------------------------------------
@@ -359,7 +355,7 @@ def build_anndata_streaming(
     # Set var_names to numeric strings (AnnData will coerce to strings anyway)
     var_df.index = pd.Index(
         [str(i) for i in range(n_sites)],
-        name="locus_id",
+        name="locus_idx",
     )
     del loci_pd, end_vals
 

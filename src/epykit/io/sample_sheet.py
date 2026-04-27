@@ -37,6 +37,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Union
+import shutil
 
 import pandas as pd
 import polars as pl
@@ -240,42 +241,12 @@ def read_samples(
     if n_workers is None:
         n_workers = min(n_samples, os.cpu_count() or 4)
 
-    logger.info("Loading %d samples with %d workers …", n_samples, n_workers)
-
-    # --- Parallel sample loading ---
-    results: dict[str, pl.DataFrame] = {}
-
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futures = {
-            pool.submit(
-                _load_single_sample,
-                row["sample_id"],
-                Path(row["path"]),
-                fmt or _detect_format(Path(row["path"])),
-                min_coverage,
-                max_coverage,
-                context,
-                rk,
-            ): row["sample_id"]
-            for _, row in ss.iterrows()
-        }
-
-        for future in as_completed(futures):
-            sid = futures[future]
-            try:
-                sample_id, df = future.result()
-                results[sample_id] = df
-                logger.info("  ✓ %s  (%d sites)", sample_id, len(df))
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to load sample '{sid}': {exc}"
-                ) from exc
-
-    # --- Route to appropriate engine ---
+    # --- Route to appropriate engine (early, before Polars loading) ---
     if engine == "duckdb":
         from epykit.io.anndata_builder_duckdb import build_anndata_streaming
         
-        # DuckDB engine reads directly from files (doesn't use loaded results)
+        # DuckDB engine reads directly from files (no Polars preload needed)
+        logger.info("Loading %d samples with DuckDB streaming engine …", n_samples)
         adata = build_anndata_streaming(
             sample_ids=list(ss["sample_id"]),
             file_paths=[Path(row["path"]) for _, row in ss.iterrows()],
@@ -287,6 +258,37 @@ def read_samples(
             duckdb_threads=duckdb_threads,
         )
     elif engine == "polars":
+        logger.info("Loading %d samples with %d workers …", n_samples, n_workers)
+
+        # --- Parallel sample loading (Polars engine) ---
+        results: dict[str, pl.DataFrame] = {}
+
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(
+                    _load_single_sample,
+                    row["sample_id"],
+                    Path(row["path"]),
+                    fmt or _detect_format(Path(row["path"])),
+                    min_coverage,
+                    max_coverage,
+                    context,
+                    rk,
+                ): row["sample_id"]
+                for _, row in ss.iterrows()
+            }
+
+            for future in as_completed(futures):
+                sid = futures[future]
+                try:
+                    sample_id, df = future.result()
+                    results[sample_id] = df
+                    logger.info("  ✓ %s  (%d sites)", sample_id, len(df))
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed to load sample '{sid}': {exc}"
+                    ) from exc
+
         # Build sample metadata (obs)
         meta_cols = [c for c in ss.columns if c != "path"]
         obs_df = ss[meta_cols].set_index("sample_id")
@@ -313,8 +315,29 @@ def read_samples(
                 "out_path is required when output='zarr'"
             )
         out_path = Path(out_path)
+
+        # Ensure we get "write" semantics across anndata versions:
+        # remove any existing Zarr store, then write a fresh one.
+        if out_path.exists():
+            shutil.rmtree(out_path)
+
         logger.info("Writing AnnData to Zarr: %s", out_path)
-        adata.write_zarr(str(out_path), mode="w")
+
+        index_name = adata.var.index.name
+        if index_name and index_name in adata.var.columns:
+            col = adata.var[index_name]
+            # Convert index to Series for element-wise comparison without dtype fuss.
+            idx_series = col.__class__(adata.var.index)
+            if not col.equals(idx_series):
+                new_name = f"{index_name}_index"
+                logger.warning(
+                    "Renaming var.index from '%s' to '%s' to avoid collision with column",
+                    index_name,
+                    new_name,
+                )
+                adata.var.index = adata.var.index.set_names(new_name)
+
+        adata.write_zarr(str(out_path))
         adata = ad.read_zarr(str(out_path))
     elif output != "memory":
         raise ValueError(
