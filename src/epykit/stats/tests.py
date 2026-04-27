@@ -220,7 +220,7 @@ def calculate_diff_meth(
         result[col] = arr
 
     result = result.sort_values("pvalue").reset_index(drop=False).rename(
-        columns={"index": "locus_key"}
+        columns={"index": mdata.var_names.name or "locus_id"}
     )
 
     n_sig = int((result["qvalue"] < 0.05).sum())

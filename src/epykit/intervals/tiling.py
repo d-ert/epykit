@@ -98,9 +98,11 @@ def tile_counts(
         step = window
 
     # Extract site coordinates from var
+    # Dynamically get the index name (could be "locus_key", "locus_id", or other)
+    idx_name = adata.var.index.name or "index"
     sites_pl = pl.from_pandas(
         adata.var[["chr", "start", "end"]].reset_index()
-    ).rename({"locus_key": "_site_key"})
+    ).rename({idx_name: "_site_key"})
 
     # --- Generate tiles ---
     # Get chromosome sizes from the data (max end position per chr)
@@ -277,8 +279,9 @@ def annotate_features(
         )
 
     # Sites as Polars DataFrame
+    idx_name = adata.var.index.name or "index"
     sites = pl.from_pandas(adata.var[["chr", "start", "end"]].reset_index()).rename(
-        {"locus_key": "_site_key"}
+        {idx_name: "_site_key"}
     )
 
     if _HAS_POLARS_BIO:
@@ -384,8 +387,9 @@ def annotate_cpg_islands(
         (pl.col("end") + shelf_distance).alias("end"),
     ])
 
+    idx_name = adata.var.index.name or "index"
     sites = pl.from_pandas(adata.var[["chr", "start", "end"]].reset_index()).rename(
-        {"locus_key": "_site_key"}
+        {idx_name: "_site_key"}
     )
 
     def _get_overlapping_sites(sites_df: pl.DataFrame, regions: pl.DataFrame) -> set:

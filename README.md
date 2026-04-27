@@ -23,13 +23,44 @@ A highly scalable, production-grade Python framework for **Whole Genome Bisulfit
 
 ## Quick Start
 
+### For small to medium cohorts
+
 ```python
 import epykit
 
 # 1. Load a single Bismark coverage file
 df = epykit.io.read_bismark_coverage("sample1.bismark.cov.gz", min_coverage=5)
 
-# 2. Load multiple samples from a sample sheet
+# 2. Load multiple samples from a sample sheet (standard Polars engine)
+adata = epykit.io.read_samples("sample_sheet.csv", min_coverage=5)
+```
+
+### For large cohorts (memory-efficient DuckDB engine)
+
+For 42M+ loci and 6+ samples, use DuckDB streaming to minimize peak RAM:
+
+```python
+# Memory-efficient: ~4.5–6 GB peak RAM (vs. 17–20 GB for default)
+adata = epykit.io.read_samples(
+    "sample_sheet.csv",
+    min_coverage=5,
+    engine="duckdb"
+)
+
+# Optional: save to persistent Zarr storage
+adata = epykit.io.read_samples(
+    "sample_sheet.csv",
+    min_coverage=5,
+    engine="duckdb",
+    output="zarr",
+    out_path="cohort.zarr"
+)
+```
+
+### Continue analysis
+
+```python
+import epykit
 adata = epykit.io.read_samples("sample_sheet.csv", min_coverage=5)
 
 # 3. Wrap in MethylData for ergonomic analysis

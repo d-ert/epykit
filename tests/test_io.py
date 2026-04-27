@@ -163,6 +163,54 @@ class TestReadSamples:
         with pytest.raises(FileNotFoundError):
             read_samples("/nonexistent/sheet.csv")
 
+    def test_duckdb_engine_basic(self, sample_sheet_dir):
+        """DuckDB engine should produce valid AnnData."""
+        import anndata as ad
+        from epykit.io import read_samples
+
+        sheet = sample_sheet_dir / "sample_sheet.csv"
+        adata = read_samples(sheet, min_coverage=1, engine="duckdb")
+
+        assert isinstance(adata, ad.AnnData)
+        assert adata.n_obs == 2
+        assert adata.n_vars > 0
+        assert "coverage" in adata.layers
+        assert "methylated_counts" in adata.layers
+
+    def test_duckdb_engine_var_names_int64(self, sample_sheet_dir):
+        """DuckDB engine should have locus_id stored as int64 column."""
+        from epykit.io import read_samples
+        import numpy as np
+
+        sheet = sample_sheet_dir / "sample_sheet.csv"
+        adata = read_samples(sheet, min_coverage=1, engine="duckdb")
+
+        # AnnData coerces var_names to strings, so check:
+        # 1. var_names are numeric strings
+        assert adata.var_names.dtype == object
+        assert all(s.isdigit() for s in adata.var_names)
+        
+        # 2. locus_id column exists as int64 for genomic encoding
+        assert "locus_id" in adata.var.columns
+        assert adata.var["locus_id"].dtype in (np.int64, np.dtype('int64'))
+        
+        # 3. locus_id encodes chr and start position
+        # (can decode back: chr_id = locus_id // SCALE, start = locus_id % SCALE)
+        assert all(adata.var["locus_id"] >= 0)
+        assert len(adata.var["locus_id"]) == adata.n_vars
+
+    def test_duckdb_vs_polars_consistency(self, sample_sheet_dir):
+        """DuckDB and Polars engines should produce same shape."""
+        from epykit.io import read_samples
+
+        sheet = sample_sheet_dir / "sample_sheet.csv"
+        adata_polars = read_samples(sheet, min_coverage=1, engine="polars")
+        adata_duckdb = read_samples(sheet, min_coverage=1, engine="duckdb")
+
+        # Shapes should match (same loci found)
+        assert adata_polars.n_obs == adata_duckdb.n_obs
+        assert adata_polars.n_vars == adata_duckdb.n_vars
+
 
 class TestSavePersistence:
     """Tests for save() and load() helpers."""

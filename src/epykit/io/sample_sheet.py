@@ -148,6 +148,11 @@ def read_samples(
     join_type: str = "outer",
     n_workers: int | None = None,
     reader_kwargs: dict | None = None,
+    engine: str = "polars",
+    output: str = "memory",
+    out_path: str | Path | None = None,
+    duckdb_memory_limit: str = "2GB",
+    duckdb_threads: int | None = None,
 ) -> "AnnData":
     """Load a cohort of methylation samples and build an AnnData object.
 
@@ -266,18 +271,54 @@ def read_samples(
                     f"Failed to load sample '{sid}': {exc}"
                 ) from exc
 
-    # --- Build sample metadata (obs) ---
-    meta_cols = [c for c in ss.columns if c != "path"]
-    obs_df = ss[meta_cols].set_index("sample_id")
+    # --- Route to appropriate engine ---
+    if engine == "duckdb":
+        from epykit.io.anndata_builder_duckdb import build_anndata_streaming
+        
+        # DuckDB engine reads directly from files (doesn't use loaded results)
+        adata = build_anndata_streaming(
+            sample_ids=list(ss["sample_id"]),
+            file_paths=[Path(row["path"]) for _, row in ss.iterrows()],
+            obs_metadata=ss[[c for c in ss.columns if c != "path"]].set_index("sample_id"),
+            min_coverage=min_coverage,
+            max_coverage=max_coverage,
+            join_type=join_type,
+            duckdb_memory_limit=duckdb_memory_limit,
+            duckdb_threads=duckdb_threads,
+        )
+    elif engine == "polars":
+        # Build sample metadata (obs)
+        meta_cols = [c for c in ss.columns if c != "path"]
+        obs_df = ss[meta_cols].set_index("sample_id")
 
-    # --- Build AnnData ---
-    # Preserve order from sample sheet
-    ordered_ids = list(ss["sample_id"])
-    ordered_dfs = [results[sid] for sid in ordered_ids]
+        # Preserve order from sample sheet
+        ordered_ids = list(ss["sample_id"])
+        ordered_dfs = [results[sid] for sid in ordered_ids]
 
-    return build_anndata(
-        sample_ids=ordered_ids,
-        dataframes=ordered_dfs,
-        obs_metadata=obs_df,
-        join_type=join_type,
-    )
+        adata = build_anndata(
+            sample_ids=ordered_ids,
+            dataframes=ordered_dfs,
+            obs_metadata=obs_df,
+            join_type=join_type,
+        )
+    else:
+        raise ValueError(
+            f"Unknown engine: '{engine}'. Choose 'polars' or 'duckdb'."
+        )
+
+    # --- Handle output mode ---
+    if output == "zarr":
+        if out_path is None:
+            raise ValueError(
+                "out_path is required when output='zarr'"
+            )
+        out_path = Path(out_path)
+        logger.info("Writing AnnData to Zarr: %s", out_path)
+        adata.write_zarr(str(out_path), mode="w")
+        adata = ad.read_zarr(str(out_path))
+    elif output != "memory":
+        raise ValueError(
+            f"Unknown output format: '{output}'. Choose 'memory' or 'zarr'."
+        )
+
+    return adata
