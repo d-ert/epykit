@@ -175,6 +175,7 @@ def build_anndata_streaming(
     fill_beta_na: float = float("nan"),
     fill_counts_na: int = 0,
     regions_bed: PathLike | None = None,
+    sparse: bool = False,
 ) -> "ad.AnnData":
     """Build a cohort AnnData from Bismark files with minimal peak RAM.
 
@@ -213,6 +214,10 @@ def build_anndata_streaming(
     regions_bed:
         Optional BED file (0-based, half-open) to restrict loci during
         union/intersection and sample joins.
+    sparse:
+        If ``True``, store the beta matrix as a sparse CSR array (CSR format).
+        Significantly reduces memory for outer-join datasets where many sites
+        have zero or missing coverage. Default ``False`` (dense float32).
 
     Returns
     -------
@@ -290,7 +295,7 @@ def build_anndata_streaming(
             con.execute("INSERT INTO _regions SELECT * FROM _regions_df;")
             regions_filter_sql = (
                 "AND EXISTS (SELECT 1 FROM _regions r "
-                "WHERE r.chr = chr AND r.start <= start AND start < r.\"end\")"
+                "WHERE r.chr = s.chr AND r.start <= s.start AND s.start < r.\"end\")"
             )
 
     def _cov_filter() -> str:
@@ -317,7 +322,7 @@ def build_anndata_streaming(
                     'unmethylated': 'INTEGER'
                 }},
                 parallel = true
-            )
+            ) AS s
             WHERE {_cov_filter()}
             {regions_filter_sql}
         """
@@ -392,7 +397,12 @@ def build_anndata_streaming(
         "  [2/3] Pre-allocating output arrays (%d × %d) …", n_samples, n_sites
     )
 
-    beta_mat = np.full((n_samples, n_sites), fill_beta_na, dtype=np.float32)
+    if sparse:
+        from scipy.sparse import lil_matrix
+        beta_mat = lil_matrix((n_samples, n_sites), dtype=np.float32)
+    else:
+        beta_mat = np.full((n_samples, n_sites), fill_beta_na, dtype=np.float32)
+    
     cov_mat  = np.zeros((n_samples, n_sites), dtype=np.int32)
     meth_mat = np.zeros((n_samples, n_sites), dtype=np.int32)
     
@@ -428,12 +438,20 @@ def build_anndata_streaming(
         # Scatter covered loci into preallocated matrices.
         # locus_idx tells us which rows in the output to fill.
         locus_idx = result["locus_idx"]
-        beta_mat[i, locus_idx] = result["beta"].astype(np.float32)
-        meth_mat[i, locus_idx] = result["methylated"].astype(np.int32)
-        cov_mat[i, locus_idx]  = result["coverage"].astype(np.int32)
+        beta_vals = result["beta"].astype(np.float32)
+        meth_vals = result["methylated"].astype(np.int32)
+        cov_vals  = result["coverage"].astype(np.int32)
+        
+        if sparse:
+            for j, idx in enumerate(locus_idx):
+                beta_mat[i, idx] = beta_vals[j]
+        else:
+            beta_mat[i, locus_idx] = beta_vals
+        
+        meth_mat[i, locus_idx] = meth_vals
+        cov_mat[i, locus_idx]  = cov_vals
 
-        # Free the intermediate result before the next sample.
-        del result, locus_idx
+        del result, locus_idx, beta_vals, meth_vals, cov_vals
         gc.collect()
         
         _log_duckdb_memory_state(con, f"[STEP 3.{i}] After JOIN completed and freed for {sid}")
@@ -475,12 +493,13 @@ def build_anndata_streaming(
     chr_categories = [row[0] for row in chr_mapping_result]
     logger.debug(f"  Chromosome categories: {chr_categories}")
     
-    # Step 4b: Fetch chr codes (integers), start, and compute end efficiently
-    # Pre-allocate arrays for int32 codes and int64 starts, then convert
-    chr_codes_list = []
-    start_list = []
+    # Step 4b: Pre-allocate output arrays for chr codes and starts (no accumulation).
+    # This avoids peak-memory spike when np.concatenate holds both chunks and result.
+    logger.info("  [4/4b] Pre-allocating chr_codes and start arrays ...")
+    chr_codes_arr = np.empty(n_sites, dtype=np.int8)
+    start_arr = np.empty(n_sites, dtype=np.int32)
     
-    chunk_size = 2_000_000  # 2M rows per chunk (back to larger, safe with int fetches)
+    chunk_size = 2_000_000
     offset = 0
     
     while offset < n_sites:
@@ -511,9 +530,9 @@ def build_anndata_streaming(
             LIMIT {chunk_limit} OFFSET {offset}
         """).fetchnumpy()
         
-        # Accumulate integer codes and starts (much smaller than strings)
-        chr_codes_list.append(loci_chunk["chr_code"].astype(np.int8))
-        start_list.append(loci_chunk["start"].astype(np.int32))
+        chunk_slice = slice(offset, offset + chunk_limit)
+        chr_codes_arr[chunk_slice] = loci_chunk["chr_code"].astype(np.int8)
+        start_arr[chunk_slice] = loci_chunk["start"].astype(np.int32)
         
         del loci_chunk
         gc.collect()
@@ -525,12 +544,6 @@ def build_anndata_streaming(
     _log_duckdb_memory_state(con, "[STEP 4] Before DuckDB connection closed")
     con.close()
     del con
-    gc.collect()
-    
-    # Step 4c: Concatenate arrays (safe with integers; small memory footprint)
-    chr_codes_arr = np.concatenate(chr_codes_list, dtype=np.int8)
-    start_arr = np.concatenate(start_list, dtype=np.int32)
-    del chr_codes_list, start_list
     gc.collect()
     
     end_vals = (start_arr.astype(np.int64) + 1).astype(np.int32)
@@ -568,8 +581,14 @@ def build_anndata_streaming(
     # ------------------------------------------------------------------
     # Assemble and return AnnData
     # ------------------------------------------------------------------
+    if sparse:
+        from scipy.sparse import csr_matrix
+        X = csr_matrix(beta_mat)
+    else:
+        X = beta_mat
+    
     adata = ad.AnnData(
-        X=beta_mat,
+        X=X,
         obs=obs_df,
         var=var_df,
         layers={
@@ -577,6 +596,9 @@ def build_anndata_streaming(
             "methylated_counts": meth_mat,
         },
     )
+
+    del beta_mat, cov_mat, meth_mat, X
+    gc.collect()
 
     rss_after_adata = _get_rss_mb()
     print(f"[AnnData assembly] RSS delta: {rss_after_adata - rss_before_adata:.1f} MB")

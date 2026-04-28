@@ -250,6 +250,20 @@ class TestReadSamples:
         assert adata.n_obs == 2
         assert adata.n_vars > 0
 
+    def test_zarr_var_index_collision_renamed(self, sample_sheet_dir, tmp_path):
+        """Var index name collisions should be renamed before Zarr writes."""
+        import pandas as pd
+        from epykit.io import read_samples
+        import epykit.io.sample_sheet as ss_mod
+
+        sheet = sample_sheet_dir / "sample_sheet.csv"
+        adata = read_samples(sheet, min_coverage=1)
+        adata.var.index = adata.var.index.set_names("locus_key")
+        adata.var["locus_key"] = pd.Series(adata.var.index, index=adata.var.index)
+
+        ss_mod._ensure_var_index_safe(adata)
+        assert adata.var.index.name == "locus_key_index"
+
 
 class TestRegionsBed:
     """Tests for regions_bed filtering across engines."""

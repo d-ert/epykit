@@ -79,11 +79,32 @@ class TestFilterCoverage:
         assert toy_mdata.n_sites == original_n  # original unchanged
 
     def test_filtered_coverage_passes_threshold(self, toy_mdata):
-        """All sites in filtered result must meet threshold."""
+        """Lenient mode keeps sites where any sample meets the threshold."""
         min_cov = 15
         filtered = toy_mdata.filter_coverage(min_cov=min_cov)
         if filtered.n_sites > 0:
-            assert (filtered.coverage >= min_cov).all()
+            assert (filtered.coverage >= min_cov).any(axis=0).all()
+
+    def test_require_all_samples_strictness(self, toy_mdata):
+        """Strict filtering should be a subset of lenient filtering."""
+        min_cov = 45
+        strict = toy_mdata.filter_coverage(min_cov=min_cov, require_all_samples=True)
+        lenient = toy_mdata.filter_coverage(min_cov=min_cov, require_all_samples=False)
+        assert strict.n_sites <= lenient.n_sites
+        assert set(strict.var_names).issubset(set(lenient.var_names))
+
+    def test_require_all_samples_differs(self, toy_adata):
+        """Strict vs lenient should differ when only some samples pass min_cov."""
+        from epykit.core import MethylData
+
+        adata = toy_adata.copy()
+        adata.layers["coverage"][0, 0] = 50
+        adata.layers["coverage"][1:, 0] = 1
+        mdata = MethylData(adata)
+
+        strict = mdata.filter_coverage(min_cov=10, require_all_samples=True)
+        lenient = mdata.filter_coverage(min_cov=10, require_all_samples=False)
+        assert strict.n_sites < lenient.n_sites
 
 
 class TestSubsetContext:

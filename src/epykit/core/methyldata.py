@@ -173,9 +173,10 @@ class MethylData:
         Parameters
         ----------
         min_cov:
-            Minimum read coverage required.  Sites where *any* sample
-            falls below this threshold are removed (when
-            ``require_all_samples=False``).
+            Minimum read coverage required. If ``require_all_samples=False``,
+            a site is retained when *any* sample meets this threshold
+            (lenient). If ``require_all_samples=True``, all samples must meet
+            the threshold.
         max_cov:
             Maximum read coverage.  Sites where *any* sample exceeds this
             threshold are discarded (PCR deduplication filter).
@@ -183,8 +184,8 @@ class MethylData:
             If ``True``, a site is retained only if **all** samples meet
             the minimum coverage threshold (more stringent, equivalent to
             ``methylKit::unite(min.per.group=n)``).
-            If ``False`` (default), only sites where *any* sample fails
-            are removed.
+            If ``False`` (default), a site is retained if *any* sample meets
+            the minimum coverage threshold (lenient).
 
         Returns
         -------
@@ -202,8 +203,8 @@ class MethylData:
             # Keep sites where ALL samples meet min_cov
             mask = np.all(cov >= min_cov, axis=0)
         else:
-            # Keep sites where NO sample falls below min_cov
-            mask = np.all(cov >= min_cov, axis=0)
+            # Keep sites where ANY sample meets min_cov
+            mask = np.any(cov >= min_cov, axis=0)
 
         if max_cov is not None:
             mask = mask & np.all(cov <= max_cov, axis=0)

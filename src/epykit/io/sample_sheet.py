@@ -136,6 +136,24 @@ def _load_single_sample(
     return sample_id, df
 
 
+def _ensure_var_index_safe(adata: "AnnData") -> None:
+    """Ensure var.index name does not collide with an existing column.
+
+    AnnData/Zarr writers can behave unpredictably if the index name matches
+    a column name with non-identical values. We defensively rename the index
+    to avoid collisions.
+    """
+    index_name = adata.var.index.name
+    if index_name and index_name in adata.var.columns:
+        new_name = f"{index_name}_index"
+        logger.warning(
+            "Renaming var.index from '%s' to '%s' to avoid collision with column",
+            index_name,
+            new_name,
+        )
+        adata.var.index = adata.var.index.set_names(new_name)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -342,19 +360,7 @@ def read_samples(
 
         logger.info("Writing AnnData to Zarr: %s", out_path)
 
-        index_name = adata.var.index.name
-        if index_name and index_name in adata.var.columns:
-            col = adata.var[index_name]
-            # Convert index to Series for element-wise comparison without dtype fuss.
-            idx_series = col.__class__(adata.var.index)
-            if not col.equals(idx_series):
-                new_name = f"{index_name}_index"
-                logger.warning(
-                    "Renaming var.index from '%s' to '%s' to avoid collision with column",
-                    index_name,
-                    new_name,
-                )
-                adata.var.index = adata.var.index.set_names(new_name)
+        _ensure_var_index_safe(adata)
 
         adata.write_zarr(str(out_path))
         

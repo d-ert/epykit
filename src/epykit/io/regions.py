@@ -98,19 +98,21 @@ def filter_lazyframe_to_regions(
     if regions.is_empty():
         return lf.filter(pl.lit(False))
 
-    regions = regions.sort(["chr", "start"])
+    regions = regions.sort(["chr", "start"]).rename(
+        {"start": "region_start", "end": "region_end"}
+    )
 
     return (
         lf.sort(["chr", "start"])
         .join_asof(
             regions.lazy(),
             left_on="start",
-            right_on="start",
+            right_on="region_start",
             by="chr",
             strategy="backward",
         )
-        .filter(pl.col("start") < pl.col("end_right"))
-        .drop(["start_right", "end_right"])
+        .filter(pl.col("start") < pl.col("region_end"))
+        .drop(["region_start", "region_end"])
     )
 
 

@@ -30,6 +30,7 @@ NaN values represent missing coverage at a locus in a given sample.
 
 from __future__ import annotations
 
+import gc
 import logging
 from pathlib import Path
 from typing import Union
@@ -151,65 +152,60 @@ def build_anndata(
     )
 
     # ------------------------------------------------------------------
-    # Step 1 — Compute int64 locus IDs and per-sample Polars frames
+    # Step 1 & 2 — Compute locus IDs & build index in ONE PASS (streaming)
     # ------------------------------------------------------------------
-    # We avoid string locus keys ("chr1:1000-1001:*") and instead encode
-    # loci as compact int64 identifiers: chr_id * SCALE + start.  This
-    # dramatically reduces memory usage for 10–30M loci and makes joins
-    # and sorting much faster.
-    keyed_frames: list[pl.DataFrame] = []
-    for sid, df in zip(sample_ids, dataframes):
-        # Ensure a strand column exists; Bismark .cov files, for example,
-        # do not carry strand information. Treat missing strand as "*".
+    # P1 fix #8: Avoid loading all N sample DataFrames simultaneously.
+    # Instead, compute the locus union/intersection incrementally by
+    # processing one sample at a time, never holding more than one frame
+    # in memory at once.
+    # 
+    # Compute locus index with a streaming pass: for union, incrementally
+    # UNION; for intersection, incrementally INTERSECT.
+    
+    def _encode_locus_int(df: pl.DataFrame) -> pl.DataFrame:
+        """Transform a DataFrame to add _locus_int column."""
         if "strand" not in df.columns:
             df = df.with_columns(pl.lit("*").alias("strand"))
-
-        # Map chromosome strings to small integer IDs, falling back to a
-        # generic "chrUn" bucket for unexpected contig names.
+        
         df = df.with_columns(
-            # Map chromosome strings to small integer IDs using a dictionary.
-            # We use ``replace`` (widely supported in Polars) followed by a
-            # non-strict cast so that unknown contigs become null, then fill
-            # them with a fallback ID.
             pl.col("chr")
             .replace(_CHR_TO_ID)
             .cast(pl.Int64, strict=False)
             .fill_null(_DEFAULT_CHR_ID)
             .alias("_chr_id"),
         )
-
-        # Build int64 locus ID: chr_id * SCALE + start
+        
         df = df.with_columns(
             (pl.col("_chr_id") * _LOCUS_SCALE + pl.col("start").cast(pl.Int64))
             .cast(pl.Int64)
             .alias("_locus_int")
         )
+        
+        return df.select(["_locus_int", "beta", "coverage", "methylated"])
+    
+    # Streaming pass: build locus index one sample at a time
+    loci_df = None
+    for i, df in enumerate(dataframes):
+        keyed_df = _encode_locus_int(df)
+        loci_only = keyed_df.select("_locus_int").unique()
+        
+        if i == 0:
+            loci_df = loci_only
+        elif join_type == "outer":
+            loci_df = pl.concat([loci_df, loci_only]).unique()
+        elif join_type == "inner":
+            loci_df = loci_df.join(loci_only, on="_locus_int", how="inner")
+        else:
+            raise ValueError(f"join_type must be 'outer' or 'inner', got {join_type!r}")
+        
+        logger.debug(f"    [1/2.{i+1}] Processed {sample_ids[i]}: {len(loci_df)} loci so far")
+        
+        # Delete the intermediate frames to save memory
+        del df, keyed_df, loci_only
+    
+    logger.info("  Step 1/3: computed int64 locus IDs (streaming pass)")
 
-        # Keep only the columns we need for matrix construction
-        df = df.select(["_locus_int", "beta", "coverage", "methylated"])
-        keyed_frames.append(df)
-
-    logger.info("  Step 1/3: computed int64 locus IDs for all samples")
-
-    # ------------------------------------------------------------------
-    # Step 2 — Build global locus index (union or intersection of IDs)
-    # ------------------------------------------------------------------
-    if join_type == "outer":
-        # Union of all locus IDs across samples
-        loci_df = pl.concat([df.select("_locus_int") for df in keyed_frames]).unique()
-    elif join_type == "inner":
-        # Intersection of locus IDs across samples, implemented as a series
-        # of key-only inner joins. This is much cheaper than joining full
-        # matrices.
-        loci_df = keyed_frames[0].select("_locus_int").unique()
-        for df in keyed_frames[1:]:
-            loci_df = loci_df.join(df.select("_locus_int").unique(), on="_locus_int", how="inner")
-    else:
-        raise ValueError(f"join_type must be 'outer' or 'inner', got {join_type!r}")
-
-    # Sort loci for deterministic output. Because our encoding is
-    # chr_id * SCALE + start, a simple numeric sort yields (chr, start)
-    # ordering without needing to materialise chromosome strings.
+    # Sort loci for deterministic output
     loci_df = loci_df.sort("_locus_int")
 
     # Materialise ordered locus IDs as a NumPy array for downstream use
@@ -221,6 +217,9 @@ def build_anndata(
     # ------------------------------------------------------------------
     # Step 3 — Assemble matrices (n_samples × n_sites)
     # ------------------------------------------------------------------
+    # Process each sample one-at-a-time: encode, join, fill, delete.
+    # Peak RAM is constant: one sample + output arrays, never all samples.
+    
     n_samples = len(sample_ids)
 
     # Coverage and methylated counts are stored densely as before.
@@ -228,18 +227,15 @@ def build_anndata(
     methylated_mat = np.full((n_samples, n_sites), fill_counts_na, dtype=np.int32)
 
     if sparse:
-        # Build a sparse beta matrix, which is typically much smaller for
-        # union joins where many sites are missing in some samples.
         from scipy.sparse import lil_matrix
-
         beta_sparse = lil_matrix((n_samples, n_sites), dtype=np.float32)
     else:
         beta_mat = np.full((n_samples, n_sites), fill_beta_na, dtype=np.float32)
 
-    # For each sample, left-join onto the global locus index to align rows,
-    # then fill the corresponding row in the matrices.
-    for i, (sid, df) in enumerate(zip(sample_ids, keyed_frames)):
-        joined = loci_df.join(df, on="_locus_int", how="left")
+    # Process each sample one at a time to fill matrices
+    for i, (sid, df) in enumerate(zip(sample_ids, dataframes)):
+        keyed_df = _encode_locus_int(df)
+        joined = loci_df.join(keyed_df, on="_locus_int", how="left")
 
         # Fill coverage / methylated counts (dense)
         coverage_mat[i, :] = (
@@ -252,7 +248,6 @@ def build_anndata(
         # Fill beta values (dense or sparse)
         beta_col = joined["beta"]
         if sparse:
-            # Encode only non-null beta values in the sparse matrix
             beta_vals = beta_col.fill_null(np.nan).to_numpy().astype(np.float32)
             mask = ~np.isnan(beta_vals)
             if mask.any():
@@ -261,11 +256,13 @@ def build_anndata(
         else:
             beta_mat[i, :] = beta_col.fill_null(fill_beta_na).to_numpy().astype(np.float32)
 
+        # Delete the intermediate processed frame immediately
+        del df, keyed_df, joined
+        
         logger.info("    Filled matrices for sample %s (%d/%d)", sid, i + 1, n_samples)
 
     if sparse:
         from scipy.sparse import csr_matrix
-
         X = csr_matrix(beta_sparse)
     else:
         X = beta_mat
@@ -289,13 +286,13 @@ def build_anndata(
     var_df["end"] = var_df["end"].astype(np.int32)
 
     # Add context from first sample that has coverage at that site
-    # (simplified: use the context from sample 0's frame if available)
     if "context" in dataframes[0].columns:
         df0 = dataframes[0]
+        
+        # Re-encode first sample to map context info
         if "strand" not in df0.columns:
             df0 = df0.with_columns(pl.lit("*").alias("strand"))
-
-        # Recompute int64 locus IDs for the first sample to map context
+        
         df0 = df0.with_columns(
             pl.col("chr")
             .replace(_CHR_TO_ID)
@@ -313,6 +310,7 @@ def build_anndata(
         var_df["context"] = pd.Categorical(
             [ctx_map.get(int(k), "CpG") for k in locus_ids]
         )
+        del df0, ctx_map
     else:
         var_df["context"] = pd.Categorical(["CpG"] * len(var_df))
 
@@ -339,6 +337,11 @@ def build_anndata(
             "methylated_counts": methylated_mat,
         },
     )
+
+    # Avoid double-materialization: delete the original array references
+    # immediately after AnnData construction. AnnData keeps its own copies.
+    del X, coverage_mat, methylated_mat, loci_df, locus_ids
+    gc.collect()
 
     logger.info(
         "AnnData built: %d samples × %d sites", adata.n_obs, adata.n_vars

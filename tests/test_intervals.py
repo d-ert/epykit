@@ -250,3 +250,26 @@ class TestAnnotateCpGIslands:
         from epykit.intervals.tiling import annotate_cpg_islands
         with pytest.raises(FileNotFoundError):
             annotate_cpg_islands(small_adata, tmp_path / "missing.bed")
+
+    def test_polars_bio_routing(self, small_adata, cpgi_bed, monkeypatch):
+        """When polars-bio is available, overlap should route via it."""
+        import epykit.intervals.tiling as tiling
+        from epykit.intervals.tiling import annotate_cpg_islands
+
+        calls = {"bio": 0, "pure": 0}
+        original_pure = tiling._overlap_pure_polars
+
+        def _bio(*args, **kwargs):
+            calls["bio"] += 1
+            return original_pure(*args, **kwargs)
+
+        def _pure(*args, **kwargs):
+            calls["pure"] += 1
+            return original_pure(*args, **kwargs)
+
+        monkeypatch.setattr(tiling, "_HAS_POLARS_BIO", True)
+        monkeypatch.setattr(tiling, "_overlap_polars_bio", _bio)
+        monkeypatch.setattr(tiling, "_overlap_pure_polars", _pure)
+
+        annotate_cpg_islands(small_adata, cpgi_bed)
+        assert calls["bio"] > 0

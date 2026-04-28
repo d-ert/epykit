@@ -162,13 +162,16 @@ def tile_counts(
     tile_meth = np.zeros((n_samples, n_tiles), dtype=np.int32)
 
     s2t = site_to_tile.select(["_site_idx", "_tile_key"]).to_pandas()
-    for _, row in s2t.iterrows():
-        s_i = int(row["_site_idx"])
-        t_i = tile_idx_map.get(row["_tile_key"], -1)
-        if t_i < 0:
-            continue
-        tile_cov[:, t_i] += cov_arr[:, s_i]
-        tile_meth[:, t_i] += meth_arr[:, s_i]
+    site_indices = s2t["_site_idx"].to_numpy(dtype=np.int32)
+    tile_indices = s2t["_tile_key"].map(tile_idx_map).to_numpy(dtype=np.int32)
+    valid = tile_indices >= 0
+
+    if valid.any():
+        for t in np.unique(tile_indices[valid]):
+            mask = (tile_indices == t) & valid
+            cols = site_indices[mask]
+            tile_cov[:, t] = cov_arr[:, cols].sum(axis=1)
+            tile_meth[:, t] = meth_arr[:, cols].sum(axis=1)
 
     # Compute beta for tiles
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -394,7 +397,10 @@ def annotate_cpg_islands(
 
     def _get_overlapping_sites(sites_df: pl.DataFrame, regions: pl.DataFrame) -> set:
         """Return set of site keys that overlap regions."""
-        result = _overlap_pure_polars(sites_df, regions)
+        if _HAS_POLARS_BIO:
+            result = _overlap_polars_bio(sites_df, regions)
+        else:
+            result = _overlap_pure_polars(sites_df, regions)
         return set(result["_site_key"].to_list())
 
     island_keys = _get_overlapping_sites(sites, islands)
