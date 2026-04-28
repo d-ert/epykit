@@ -51,8 +51,8 @@ try:
         obs_metadata=obs_metadata,
         min_coverage=10,
         join_type="outer",
-        duckdb_memory_limit="12GB",
-        duckdb_threads=2,
+        duckdb_memory_limit="13GB",
+        duckdb_threads=3,
         regions_bed="test_regions_6.bed",
     )
     elapsed = time.time() - start
