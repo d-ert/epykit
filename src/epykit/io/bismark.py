@@ -27,6 +27,8 @@ from typing import Union
 
 import polars as pl
 
+from epykit.io.regions import ensure_regions_dataframe, filter_lazyframe_to_regions
+
 # ---------------------------------------------------------------------------
 # Type alias
 # ---------------------------------------------------------------------------
@@ -37,8 +39,8 @@ PathLike = Union[str, Path]
 # ---------------------------------------------------------------------------
 _BISMARK_COV_SCHEMA: dict[str, type] = {
     "chr": pl.Utf8,
-    "start": pl.Int64,
-    "end": pl.Int64,
+    "start": pl.Int32,
+    "end": pl.Int32,
     "beta": pl.Float64,
     "methylated": pl.Int32,
     "unmethylated": pl.Int32,
@@ -46,7 +48,7 @@ _BISMARK_COV_SCHEMA: dict[str, type] = {
 
 _CX_REPORT_SCHEMA: dict[str, type] = {
     "chr": pl.Utf8,
-    "position": pl.Int64,
+    "position": pl.Int32,
     "strand": pl.Utf8,
     "methylated": pl.Int32,
     "unmethylated": pl.Int32,
@@ -65,6 +67,7 @@ def read_bismark_coverage(
     max_coverage: int | None = None,
     context: str | None = None,
     low_memory: bool = False,
+    regions: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Read a Bismark coverage file (``.bismark.cov`` / ``.cov.gz``).
 
@@ -101,8 +104,8 @@ def read_bismark_coverage(
     pl.DataFrame
         Columns:
             - ``chr``         : chromosome name (Utf8)
-            - ``start``       : 1-based start position (Int64)
-            - ``end``         : 1-based end position (Int64)
+            - ``start``       : 0-based start position (Int32)
+            - ``end``         : 0-based end position (Int32)
             - ``beta``        : percent methylation 0–100 (Float64)
             - ``methylated``  : methylated read count (Int32)
             - ``unmethylated``: unmethylated read count (Int32)
@@ -140,12 +143,16 @@ def read_bismark_coverage(
     if max_coverage is not None:
         lf = lf.filter(pl.col("coverage") <= max_coverage)
 
+    if regions is not None:
+        regions = ensure_regions_dataframe(regions)
+        lf = filter_lazyframe_to_regions(lf, regions)
+
     # Cast types after potential low_memory string ingest
     if low_memory:
         lf = lf.with_columns(
             pl.col("chr").cast(pl.Utf8),
-            pl.col("start").cast(pl.Int64),
-            pl.col("end").cast(pl.Int64),
+            pl.col("start").cast(pl.Int32),
+            pl.col("end").cast(pl.Int32),
             pl.col("beta").cast(pl.Float64),
             pl.col("methylated").cast(pl.Int32),
             pl.col("unmethylated").cast(pl.Int32),
@@ -160,6 +167,7 @@ def read_bismark_cx_report(
     min_coverage: int = 1,
     max_coverage: int | None = None,
     context: str | None = "CpG",
+    regions: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Read a Bismark CX_report file (all cytosine contexts).
 
@@ -182,7 +190,7 @@ def read_bismark_cx_report(
     Returns
     -------
     pl.DataFrame
-        Columns: ``chr``, ``start`` (position), ``end`` (position + 1),
+        Columns: ``chr``, ``start`` (position - 1), ``end`` (position),
         ``strand``, ``methylated``, ``unmethylated``, ``coverage``,
         ``context``, ``trinucleotide``, ``beta``.
 
@@ -208,8 +216,8 @@ def read_bismark_cx_report(
 
     # Normalise to BED-style half-open [start, end)
     lf = lf.with_columns(
-        pl.col("position").alias("start"),
-        (pl.col("position") + 1).alias("end"),
+        (pl.col("position") - 1).alias("start"),
+        pl.col("position").alias("end"),
     )
 
     # Derive coverage and beta
@@ -225,6 +233,10 @@ def read_bismark_cx_report(
 
     if max_coverage is not None:
         lf = lf.filter(pl.col("coverage") <= max_coverage)
+
+    if regions is not None:
+        regions = ensure_regions_dataframe(regions)
+        lf = filter_lazyframe_to_regions(lf, regions)
 
     # Compute beta after coverage filter to avoid division by zero
     lf = lf.with_columns(

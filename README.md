@@ -44,7 +44,14 @@ For 42M+ loci and 6+ samples, use DuckDB streaming to minimize peak RAM:
 adata = epykit.io.read_samples(
     "sample_sheet.csv",
     min_coverage=5,
-    engine="duckdb"
+    engine="duckdb",
+)
+
+# Optional: restrict to BED regions (0-based, half-open)
+adata = epykit.io.read_samples(
+    "sample_sheet.csv",
+    min_coverage=5,
+    regions_bed="promoters.bed",
 )
 
 # Optional: save to persistent Zarr storage
@@ -132,7 +139,8 @@ src/epykit/
 
 ## Architectural Design
 
-This package is built on the **AnnData** specification:
+This package is built on the **AnnData** specification and uses
+0-based, half-open coordinates internally (BED style):
 
 - **`adata.X`** — Beta-value matrix (methylation %) | shape: `(n_samples, n_sites)`
 - **`adata.obs`** — Sample metadata (group, batch, age, etc.)

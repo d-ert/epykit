@@ -7,11 +7,11 @@ These readers normalise third-party aligner outputs (bwa-meth, BSBolt,
 BSMAP, etc.) into the same Polars DataFrame schema used by the Bismark
 reader, enabling seamless integration with the rest of the pipeline.
 
-Standard internal schema
-------------------------
+Standard internal schema (0-based, half-open)
+---------------------------------------------
     chr          : Utf8    — chromosome name
-    start        : Int64   — 1-based start position
-    end          : Int64   — end position
+    start        : Int32   — start position (0-based)
+    end          : Int32   — end position (0-based, half-open)
     strand       : Utf8    — "+" / "-" / "*"
     beta         : Float64 — methylation percentage (0–100)
     methylated   : Int32   — methylated read count
@@ -27,6 +27,8 @@ from typing import Union
 
 import polars as pl
 
+from epykit.io.regions import ensure_regions_dataframe, filter_lazyframe_to_regions
+
 PathLike = Union[str, Path]
 
 
@@ -41,6 +43,7 @@ def read_bedgraph(
     min_coverage: int = 1,
     sep: str = "\t",
     has_header: bool = False,
+    regions: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Read a 4-column bedGraph file.
 
@@ -99,6 +102,16 @@ def read_bedgraph(
         .alias(value_col)
     )
 
+    lf = lf.with_columns(
+        pl.col("chr").cast(pl.Utf8),
+        pl.col("start").cast(pl.Int32),
+        pl.col("end").cast(pl.Int32),
+    )
+
+    if regions is not None:
+        regions = ensure_regions_dataframe(regions)
+        lf = filter_lazyframe_to_regions(lf, regions)
+
     return lf.collect()
 
 
@@ -123,6 +136,7 @@ def read_generic_methylation(
     comment_char: str | None = "#",
     min_coverage: int = 1,
     max_coverage: int | None = None,
+    regions: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Read a generic tab-separated methylation file.
 
@@ -265,13 +279,17 @@ def read_generic_methylation(
     # --- Type normalisation ---
     lf = lf.with_columns(
         pl.col("chr").cast(pl.Utf8),
-        pl.col("start").cast(pl.Int64),
-        pl.col("end").cast(pl.Int64),
+        pl.col("start").cast(pl.Int32),
+        pl.col("end").cast(pl.Int32),
         pl.col("beta").cast(pl.Float64),
         pl.col("methylated").cast(pl.Int32),
         pl.col("unmethylated").cast(pl.Int32),
         pl.col("coverage").cast(pl.Int32),
     )
+
+    if regions is not None:
+        regions = ensure_regions_dataframe(regions)
+        lf = filter_lazyframe_to_regions(lf, regions)
 
     # --- Select standard output columns (keeping any extras last) ---
     std_cols = ["chr", "start", "end", "strand", "beta",

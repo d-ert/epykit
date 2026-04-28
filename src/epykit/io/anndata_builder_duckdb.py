@@ -62,6 +62,7 @@ from typing import Union
 
 import numpy as np
 import pandas as pd
+from epykit.io.regions import merge_bed_intervals, read_bed_regions
 
 logger = logging.getLogger(__name__)
 PathLike = Union[str, Path]
@@ -121,6 +122,7 @@ def build_anndata_streaming(
     duckdb_threads: int | None = None,
     fill_beta_na: float = float("nan"),
     fill_counts_na: int = 0,
+    regions_bed: PathLike | None = None,
 ) -> "ad.AnnData":
     """Build a cohort AnnData from Bismark files with minimal peak RAM.
 
@@ -156,6 +158,9 @@ def build_anndata_streaming(
         Value written for sites absent in a sample.  Default ``NaN``.
     fill_counts_na:
         Value written for absent coverage/count cells.  Default ``0``.
+    regions_bed:
+        Optional BED file (0-based, half-open) to restrict loci during
+        union/intersection and sample joins.
 
     Returns
     -------
@@ -220,6 +225,18 @@ def build_anndata_streaming(
     # SQL helpers
     # ------------------------------------------------------------------
 
+    regions_filter_sql = ""
+    if regions_bed is not None:
+        regions_df = merge_bed_intervals(read_bed_regions(regions_bed))
+        if not regions_df.empty:
+            con.execute("CREATE TEMP TABLE _regions (chr VARCHAR, start INTEGER, end INTEGER);")
+            con.register("_regions_df", regions_df)
+            con.execute("INSERT INTO _regions SELECT * FROM _regions_df;")
+            regions_filter_sql = (
+                "AND EXISTS (SELECT 1 FROM _regions r "
+                "WHERE r.chr = chr AND r.start <= start AND start < r.end)"
+            )
+
     def _cov_filter() -> str:
         parts = [f"(methylated + unmethylated) >= {min_coverage}"]
         if max_coverage is not None:
@@ -246,6 +263,7 @@ def build_anndata_streaming(
                 parallel = true
             )
             WHERE {_cov_filter()}
+            {regions_filter_sql}
         """
 
     # ------------------------------------------------------------------
@@ -338,11 +356,11 @@ def build_anndata_streaming(
 
     end_vals = loci_pd["start"].values + 1
     var_df = pd.DataFrame({
-        "chr":     loci_pd["chr"].values,
-        "start":   loci_pd["start"].values.astype(np.int64),
-        "end":     end_vals.astype(np.int64),
-        "strand":  "*",
-        "context": "CpG",
+        "chr":     pd.Categorical(loci_pd["chr"].values),
+        "start":   loci_pd["start"].values.astype(np.int32),
+        "end":     end_vals.astype(np.int32),
+        "strand":  pd.Categorical(["*"] * len(loci_pd)),
+        "context": pd.Categorical(["CpG"] * len(loci_pd)),
         "locus_id": loci_pd["start"].values.astype(np.int64),  # Placeholder: will be overwritten
     })
     

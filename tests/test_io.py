@@ -91,7 +91,7 @@ class TestReadBismarkCoverage:
 
         df = read_bismark_coverage(bismark_cov_file)
         assert df["chr"].dtype == pl.Utf8
-        assert df["start"].dtype == pl.Int64
+        assert df["start"].dtype == pl.Int32
         assert df["beta"].dtype == pl.Float64
         assert df["methylated"].dtype == pl.Int32
 
@@ -249,6 +249,69 @@ class TestReadSamples:
         assert isinstance(adata, ad.AnnData)
         assert adata.n_obs == 2
         assert adata.n_vars > 0
+
+
+class TestRegionsBed:
+    """Tests for regions_bed filtering across engines."""
+
+    def test_regions_bed_reduces_vars_polars(self, sample_sheet_dir, tmp_path):
+        from epykit.io import read_samples
+
+        sheet = sample_sheet_dir / "sample_sheet.csv"
+        regions = tmp_path / "regions.bed"
+        regions.write_text("chr1\t0\t3000\n")
+
+        adata_all = read_samples(sheet, min_coverage=1, engine="polars")
+        adata_filtered = read_samples(
+            sheet, min_coverage=1, engine="polars", regions_bed=regions
+        )
+
+        assert adata_filtered.n_vars < adata_all.n_vars
+
+    def test_regions_bed_reduces_vars_duckdb(self, sample_sheet_dir, tmp_path):
+        from epykit.io import read_samples
+
+        sheet = sample_sheet_dir / "sample_sheet.csv"
+        regions = tmp_path / "regions.bed"
+        regions.write_text("chr1\t0\t3000\n")
+
+        adata_all = read_samples(sheet, min_coverage=1, engine="duckdb")
+        adata_filtered = read_samples(
+            sheet, min_coverage=1, engine="duckdb", regions_bed=regions
+        )
+
+        assert adata_filtered.n_vars < adata_all.n_vars
+
+    def test_regions_bed_consistent_across_engines(self, sample_sheet_dir, tmp_path):
+        from epykit.io import read_samples
+
+        sheet = sample_sheet_dir / "sample_sheet.csv"
+        regions = tmp_path / "regions.bed"
+        regions.write_text("chr1\t0\t3000\n")
+
+        adata_polars = read_samples(
+            sheet, min_coverage=1, engine="polars", regions_bed=regions
+        )
+        adata_duckdb = read_samples(
+            sheet, min_coverage=1, engine="duckdb", regions_bed=regions
+        )
+
+        assert adata_polars.n_vars == adata_duckdb.n_vars
+
+
+class TestCxReport:
+    """Coordinate consistency for CX_report (BED-style)."""
+
+    def test_cx_report_coordinates(self, tmp_path):
+        from epykit.io import read_bismark_cx_report
+
+        content = "chr1\t10\t+\t5\t5\tCpG\tAAA\n"
+        cx_file = tmp_path / "sample.CX_report.txt"
+        cx_file.write_text(content)
+
+        df = read_bismark_cx_report(cx_file, context="CpG")
+        assert df["start"].item() == 9
+        assert df["end"].item() == 10
 
 
 class TestSavePersistence:

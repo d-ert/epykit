@@ -45,6 +45,7 @@ import polars as pl
 from epykit.io.anndata_builder import build_anndata
 from epykit.io.bismark import read_bismark_coverage, read_bismark_cx_report
 from epykit.io.generic import read_bedgraph, read_generic_methylation
+from epykit.io.regions import load_and_merge_regions
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +155,7 @@ def read_samples(
     out_path: str | Path | None = None,
     duckdb_memory_limit: str = "2GB",
     duckdb_threads: int | None = None,
+    regions_bed: PathLike | None = None,
 ) -> "AnnData":
     """Load a cohort of methylation samples and build an AnnData object.
 
@@ -189,6 +191,9 @@ def read_samples(
     reader_kwargs:
         Additional keyword arguments forwarded to the underlying reader
         function.
+    regions_bed:
+        Optional BED file (0-based, half-open) to restrict loci during file
+        ingestion. Regions are merged per chromosome before filtering.
 
     Returns
     -------
@@ -241,6 +246,10 @@ def read_samples(
     if n_workers is None:
         n_workers = min(n_samples, os.cpu_count() or 4)
 
+    regions_df = None
+    if regions_bed is not None:
+        regions_df = load_and_merge_regions(regions_bed)
+
     # --- Route to appropriate engine (early, before Polars loading) ---
     if engine == "duckdb":
         from epykit.io.anndata_builder_duckdb import build_anndata_streaming
@@ -256,11 +265,15 @@ def read_samples(
             join_type=join_type,
             duckdb_memory_limit=duckdb_memory_limit,
             duckdb_threads=duckdb_threads,
+            regions_bed=regions_bed,
         )
     elif engine == "polars":
         logger.info("Loading %d samples with %d workers …", n_samples, n_workers)
 
         # --- Parallel sample loading (Polars engine) ---
+        if regions_df is not None:
+            rk = {**rk, "regions": regions_df}
+
         results: dict[str, pl.DataFrame] = {}
 
         with ThreadPoolExecutor(max_workers=n_workers) as pool:

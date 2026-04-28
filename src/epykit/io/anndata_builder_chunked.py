@@ -259,6 +259,10 @@ def build_anndata_chunked(
 
     var_df = pd.DataFrame(var_records, index=locus_ids)
     var_df.index.name = "locus_id"
+    var_df["chr"] = pd.Categorical(var_df["chr"])
+    var_df["strand"] = pd.Categorical(var_df["strand"])
+    var_df["start"] = var_df["start"].astype(np.int32)
+    var_df["end"] = var_df["end"].astype(np.int32)
 
     # Add context if available
     if "context" in dataframes[0].columns:
@@ -280,9 +284,11 @@ def build_anndata_chunked(
         ).select(["_locus_int", "context"])
 
         ctx_map = dict(zip(df0["_locus_int"].to_list(), df0["context"].to_list()))
-        var_df["context"] = [ctx_map.get(int(k), "CpG") for k in locus_ids]
+        var_df["context"] = pd.Categorical(
+            [ctx_map.get(int(k), "CpG") for k in locus_ids]
+        )
     else:
-        var_df["context"] = "CpG"
+        var_df["context"] = pd.Categorical(["CpG"] * len(var_df))
 
     # Build obs DataFrame
     obs_df = pd.DataFrame(index=sample_ids)
