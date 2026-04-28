@@ -156,6 +156,7 @@ def read_samples(
     duckdb_memory_limit: str = "2GB",
     duckdb_threads: int | None = None,
     regions_bed: PathLike | None = None,
+    validate_output: bool = False,
 ) -> "AnnData":
     """Load a cohort of methylation samples and build an AnnData object.
 
@@ -194,6 +195,11 @@ def read_samples(
     regions_bed:
         Optional BED file (0-based, half-open) to restrict loci during file
         ingestion. Regions are merged per chromosome before filtering.
+    validate_output:
+        When ``output="zarr"``, whether to re-read the Zarr store after writing.
+        Default ``False`` (skip re-read, saves ~1-2 GB peak RAM).
+        Set to ``True`` to validate data integrity (costs ~0.5s extra and
+        peak RAM spike during I/O completion).
 
     Returns
     -------
@@ -351,7 +357,13 @@ def read_samples(
                 adata.var.index = adata.var.index.set_names(new_name)
 
         adata.write_zarr(str(out_path))
-        adata = ad.read_zarr(str(out_path))
+        
+        # Conditionally re-read: skip by default to save RAM during peak I/O
+        if validate_output:
+            logger.info("Validating Zarr output by re-reading (validate_output=True)")
+            adata = ad.read_zarr(str(out_path))
+        else:
+            logger.debug("Skipping Zarr re-read (validate_output=False)")
     elif output != "memory":
         raise ValueError(
             f"Unknown output format: '{output}'. Choose 'memory' or 'zarr'."

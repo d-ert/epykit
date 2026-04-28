@@ -84,6 +84,58 @@ except ImportError as e:  # pragma: no cover
     ) from e
 
 
+# ---------------------------------------------------------------------------
+# Memory profiling utilities for diagnostics
+# ---------------------------------------------------------------------------
+
+import os
+import time
+from datetime import datetime
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
+
+
+def _get_rss_mb() -> float:
+    """Return resident set size (RSS) in MB."""
+    if psutil is not None:
+        return psutil.Process(os.getpid()).memory_info().rss / (1024**2)
+    # Fallback to /proc/self/status
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    return float(parts[1]) / 1024.0
+    except Exception:
+        return -1.0
+    return -1.0
+
+
+def _log_duckdb_memory_state(con: "duckdb.DuckDBPyConnection", label: str) -> None:
+    """Log current memory state and DuckDB configuration."""
+    rss_mb = _get_rss_mb()
+    rss_info = f" | RSS: {rss_mb:.1f} MB" if rss_mb >= 0 else ""
+    
+    # Query DuckDB for actual settings
+    try:
+        mem_limit = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+        thread_count_result = con.execute(
+            "SELECT current_setting('threads')"
+        ).fetchone()
+        thread_count = thread_count_result[0] if thread_count_result else "unknown"
+    except Exception:
+        mem_limit = "query failed"
+        thread_count = "query failed"
+    
+    timestamp = datetime.utcnow().isoformat()
+    print(
+        f"[{timestamp}] {label} | mem_limit={mem_limit} | threads={thread_count}{rss_info}"
+    )
+
+
 # Chromosome sort order for human (and mouse) genomes.
 # Unknown contigs are sorted last (key = 99).
 _CHR_SORT_EXPR = """
@@ -220,6 +272,9 @@ def build_anndata_streaming(
         import os
         duckdb_threads = os.cpu_count() or 4
     con.execute(f"SET threads TO {duckdb_threads};")
+    
+    # Log initial state
+    _log_duckdb_memory_state(con, "[INIT] DuckDB connection opened")
 
     # ------------------------------------------------------------------
     # SQL helpers
@@ -269,16 +324,46 @@ def build_anndata_streaming(
 
     # ------------------------------------------------------------------
     # Step 1 — Build global locus index entirely inside DuckDB
+    #          STREAMING APPROACH: UNION files one-at-a-time to minimize
+    #          peak buffer usage. Avoids materializing all 6 files at once.
     # ------------------------------------------------------------------
-    logger.info("  [1/3] Building locus index via DuckDB …")
+    logger.info("  [1/3] Building locus index via DuckDB (streaming) …")
 
     set_op = "UNION" if join_type == "outer" else "INTERSECT"
-    loci_union_sql = f"\n    {set_op}\n    ".join(
-        _read_sql(p) for p in file_paths
-    )
+    
+    # Log before starting locus union
+    _log_duckdb_memory_state(con, f"[STEP 1] Before locus UNION ({len(file_paths)} files)")
 
-    # CREATE TEMP TABLE materialises the sorted, row-numbered locus set
-    # inside DuckDB's buffer pool.  Python RAM usage: 0 bytes at this point.
+    # Build locus index incrementally by UNIONing files one at a time.
+    # This prevents DuckDB from materializing all files simultaneously in the buffer pool.
+    # Peak memory per iteration: ~size of one sample + output, not sum of all samples.
+    for idx, path in enumerate(file_paths, 1):
+        logger.debug(f"  [1/3.{idx}] Processing {path.name} ({idx}/{len(file_paths)})")
+        
+        if idx == 1:
+            # First file: initialize locus set
+            con.execute(f"""
+                CREATE TEMP TABLE _loci_temp AS
+                SELECT chr, start FROM ({_read_sql(path)})
+            """)
+        else:
+            # Subsequent files: compute union/intersection in temp table, then swap.
+            # We create in _loci_new first (avoiding reference to dropped table),
+            # then replace _loci_temp. This streams the new file and frees old buffer.
+            con.execute(f"""
+                CREATE TEMP TABLE _loci_new AS
+                SELECT chr, start FROM _loci_temp
+                {set_op}
+                SELECT chr, start FROM ({_read_sql(path)})
+            """)
+            con.execute("DROP TABLE _loci_temp")
+            con.execute("ALTER TABLE _loci_new RENAME TO _loci_temp")
+            # Explicitly trigger garbage collection on Python side
+            gc.collect()
+        
+        _log_duckdb_memory_state(con, f"[STEP 1.{idx}] After file {idx}/{len(file_paths)}")
+
+    # Finalize: sort and add locus indices
     con.execute(f"""
         CREATE TEMP TABLE _loci AS
         SELECT
@@ -289,13 +374,15 @@ def build_anndata_streaming(
                     ORDER BY ({_CHR_SORT_EXPR}), start
                 ) - 1
             AS INTEGER) AS locus_idx
-        FROM (
-            {loci_union_sql}
-        )
+        FROM _loci_temp
     """)
+    con.execute("DROP TABLE _loci_temp")
 
     n_sites: int = con.execute("SELECT COUNT(*) FROM _loci").fetchone()[0]
     logger.info("  [1/3] Locus index: %d sites.", n_sites)
+    
+    # Log after locus union
+    _log_duckdb_memory_state(con, f"[STEP 1] After locus UNION completed ({n_sites} sites)")
 
     # ------------------------------------------------------------------
     # Step 2 — Pre-allocate output arrays
@@ -308,6 +395,8 @@ def build_anndata_streaming(
     beta_mat = np.full((n_samples, n_sites), fill_beta_na, dtype=np.float32)
     cov_mat  = np.zeros((n_samples, n_sites), dtype=np.int32)
     meth_mat = np.zeros((n_samples, n_sites), dtype=np.int32)
+    
+    _log_duckdb_memory_state(con, f"[STEP 2] Arrays pre-allocated ({n_samples} × {n_sites})")
 
     # ------------------------------------------------------------------
     # Step 3 — Fill one row per sample
@@ -315,9 +404,11 @@ def build_anndata_streaming(
     #           most one sample's JOIN result in RAM at a time.
     # ------------------------------------------------------------------
     logger.info("  [3/3] Filling matrices — one sample at a time …")
+    _log_duckdb_memory_state(con, "[STEP 3] Starting sample JOIN loop")
 
     for i, (sid, path) in enumerate(zip(sample_ids, file_paths)):
         logger.info("    [%d/%d] %s", i + 1, n_samples, sid)
+        _log_duckdb_memory_state(con, f"[STEP 3.{i}] Before JOIN for sample {sid}")
 
         # DuckDB INNER JOINs the locus table against the sample file on disk.
         # Only loci present in the sample are returned (no NULLs/NaNs).
@@ -344,39 +435,127 @@ def build_anndata_streaming(
         # Free the intermediate result before the next sample.
         del result, locus_idx
         gc.collect()
+        
+        _log_duckdb_memory_state(con, f"[STEP 3.{i}] After JOIN completed and freed for {sid}")
 
     # ------------------------------------------------------------------
     # Build var DataFrame from the locus index
     # ------------------------------------------------------------------
     logger.info("  Building var DataFrame …")
-
-    loci_pd = con.execute(
-        "SELECT chr, start FROM _loci ORDER BY locus_idx"
-    ).df()
-    con.close()
-
-    end_vals = loci_pd["start"].values + 1
-    var_df = pd.DataFrame({
-        "chr":     pd.Categorical(loci_pd["chr"].values),
-        "start":   loci_pd["start"].values.astype(np.int32),
-        "end":     end_vals.astype(np.int32),
-        "strand":  pd.Categorical(["*"] * len(loci_pd)),
-        "context": pd.Categorical(["CpG"] * len(loci_pd)),
-        "locus_id": loci_pd["start"].values.astype(np.int64),  # Placeholder: will be overwritten
-    })
     
-    # Store the actual encoded int64 locus IDs in the var DataFrame
-    # locus_id = chr_id * SCALE + start (for genomic position encoding)
-    # For now, we'll use the sequential index as var_names (strings '0', '1', etc.)
-    # and keep the real locus_id in the column for downstream use
+    # KEY INSIGHT: Don't materialize 42M chromosome *strings* — instead fetch
+    # integer *codes* from DuckDB and use pd.Categorical.from_codes().
+    # Avoids 2+ GB of string overhead while achieving the same Categorical result.
+    
+    # Step 4a: Build a chromosome code mapping in DuckDB (only ~25 unique values)
+    chr_mapping_result = con.execute("""
+        SELECT DISTINCT chr, 
+               DENSE_RANK() OVER (
+                   ORDER BY CASE chr
+                       WHEN 'chr1'  THEN  1  WHEN 'chr2'  THEN  2
+                       WHEN 'chr3'  THEN  3  WHEN 'chr4'  THEN  4
+                       WHEN 'chr5'  THEN  5  WHEN 'chr6'  THEN  6
+                       WHEN 'chr7'  THEN  7  WHEN 'chr8'  THEN  8
+                       WHEN 'chr9'  THEN  9  WHEN 'chr10' THEN 10
+                       WHEN 'chr11' THEN 11  WHEN 'chr12' THEN 12
+                       WHEN 'chr13' THEN 13  WHEN 'chr14' THEN 14
+                       WHEN 'chr15' THEN 15  WHEN 'chr16' THEN 16
+                       WHEN 'chr17' THEN 17  WHEN 'chr18' THEN 18
+                       WHEN 'chr19' THEN 19  WHEN 'chr20' THEN 20
+                       WHEN 'chr21' THEN 21  WHEN 'chr22' THEN 22
+                       WHEN 'chrX'  THEN 23  WHEN 'chrY'  THEN 24
+                       WHEN 'chrM'  THEN 25  WHEN 'chrMT' THEN 25
+                       ELSE 99
+                   END
+               ) - 1 AS chr_code
+        FROM _loci
+        ORDER BY chr_code
+    """).fetchall()
+    
+    chr_categories = [row[0] for row in chr_mapping_result]
+    logger.debug(f"  Chromosome categories: {chr_categories}")
+    
+    # Step 4b: Fetch chr codes (integers), start, and compute end efficiently
+    # Pre-allocate arrays for int32 codes and int64 starts, then convert
+    chr_codes_list = []
+    start_list = []
+    
+    chunk_size = 2_000_000  # 2M rows per chunk (back to larger, safe with int fetches)
+    offset = 0
+    
+    while offset < n_sites:
+        chunk_limit = min(chunk_size, n_sites - offset)
+        loci_chunk = con.execute(f"""
+            SELECT
+                DENSE_RANK() OVER (
+                    ORDER BY CASE chr
+                        WHEN 'chr1'  THEN  1  WHEN 'chr2'  THEN  2
+                        WHEN 'chr3'  THEN  3  WHEN 'chr4'  THEN  4
+                        WHEN 'chr5'  THEN  5  WHEN 'chr6'  THEN  6
+                        WHEN 'chr7'  THEN  7  WHEN 'chr8'  THEN  8
+                        WHEN 'chr9'  THEN  9  WHEN 'chr10' THEN 10
+                        WHEN 'chr11' THEN 11  WHEN 'chr12' THEN 12
+                        WHEN 'chr13' THEN 13  WHEN 'chr14' THEN 14
+                        WHEN 'chr15' THEN 15  WHEN 'chr16' THEN 16
+                        WHEN 'chr17' THEN 17  WHEN 'chr18' THEN 18
+                        WHEN 'chr19' THEN 19  WHEN 'chr20' THEN 20
+                        WHEN 'chr21' THEN 21  WHEN 'chr22' THEN 22
+                        WHEN 'chrX'  THEN 23  WHEN 'chrY'  THEN 24
+                        WHEN 'chrM'  THEN 25  WHEN 'chrMT' THEN 25
+                        ELSE 99
+                    END
+                ) - 1 AS chr_code,
+                start
+            FROM _loci
+            ORDER BY locus_idx
+            LIMIT {chunk_limit} OFFSET {offset}
+        """).fetchnumpy()
+        
+        # Accumulate integer codes and starts (much smaller than strings)
+        chr_codes_list.append(loci_chunk["chr_code"].astype(np.int8))
+        start_list.append(loci_chunk["start"].astype(np.int32))
+        
+        del loci_chunk
+        gc.collect()
+        
+        offset += chunk_limit
+        logger.debug(f"  Fetched {offset}/{n_sites} loci")
+        _log_duckdb_memory_state(con, f"[STEP 4.chunk] Fetched {offset}/{n_sites} loci chunk")
+    
+    _log_duckdb_memory_state(con, "[STEP 4] Before DuckDB connection closed")
+    con.close()
+    del con
+    gc.collect()
+    
+    # Step 4c: Concatenate arrays (safe with integers; small memory footprint)
+    chr_codes_arr = np.concatenate(chr_codes_list, dtype=np.int8)
+    start_arr = np.concatenate(start_list, dtype=np.int32)
+    del chr_codes_list, start_list
+    gc.collect()
+    
+    end_vals = (start_arr.astype(np.int64) + 1).astype(np.int32)
+    gc.collect()
+    
+    # Step 4d: Use from_codes to avoid materializing string values
+    var_df = pd.DataFrame(index=pd.RangeIndex(n_sites, name="locus_idx"))
+    var_df["chr"]      = pd.Categorical.from_codes(chr_codes_arr, categories=chr_categories)
+    var_df["start"]    = start_arr
+    var_df["end"]      = end_vals
+    
+    # Create categorical columns with pre-computed codes
+    var_df["strand"]   = pd.Categorical.from_codes(
+        np.zeros(n_sites, dtype=np.int8),
+        categories=["*"]
+    )
+    var_df["context"]  = pd.Categorical.from_codes(
+        np.zeros(n_sites, dtype=np.int8),
+        categories=["CpG"]
+    )
     var_df["locus_id"] = np.arange(n_sites, dtype=np.int64)
     
-    # Set var_names to numeric strings (AnnData will coerce to strings anyway)
-    var_df.index = pd.Index(
-        [str(i) for i in range(n_sites)],
-        name="locus_idx",
-    )
-    del loci_pd, end_vals
+    del chr_codes_arr, start_arr, end_vals
+    gc.collect()
+    rss_before_adata = _get_rss_mb()
 
     # ------------------------------------------------------------------
     # Build obs DataFrame
@@ -398,6 +577,9 @@ def build_anndata_streaming(
             "methylated_counts": meth_mat,
         },
     )
+
+    rss_after_adata = _get_rss_mb()
+    print(f"[AnnData assembly] RSS delta: {rss_after_adata - rss_before_adata:.1f} MB")
 
     logger.info(
         "build_anndata_streaming complete: %d samples × %d sites",
