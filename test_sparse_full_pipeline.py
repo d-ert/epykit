@@ -82,9 +82,9 @@ def run_pipeline():
             obs_metadata=obs_metadata,
             min_coverage=10,
             max_coverage=500,
-            join_type="outer",
+            join_type="inner",
             duckdb_memory_limit="14GB",
-            duckdb_threads=3,
+            duckdb_threads=1,
             #regions_bed="test_regions_sparse.bed",
             sparse=True,  # <-- SPARSE MODE
         )

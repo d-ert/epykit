@@ -398,8 +398,10 @@ def build_anndata_streaming(
     )
 
     if sparse:
-        from scipy.sparse import lil_matrix
-        beta_mat = lil_matrix((n_samples, n_sites), dtype=np.float32)
+        # Collect one 1-row CSR per sample; vstack at the end.
+        # Avoids lil_matrix's O(n) Python-loop element assignment which
+        # balloons RSS by ~2 GB per sample on 42M-site outer joins.
+        _sparse_rows: list = []
     else:
         beta_mat = np.full((n_samples, n_sites), fill_beta_na, dtype=np.float32)
     
@@ -443,8 +445,16 @@ def build_anndata_streaming(
         cov_vals  = result["coverage"].astype(np.int32)
         
         if sparse:
-            for j, idx in enumerate(locus_idx):
-                beta_mat[i, idx] = beta_vals[j]
+            from scipy.sparse import csr_matrix as _csr
+            # Sort by column for valid CSR indptr construction
+            order = np.argsort(locus_idx)
+            _sparse_rows.append(_csr(
+                (beta_vals[order],
+                 locus_idx[order],
+                 np.array([0, len(locus_idx)], dtype=np.int32)),
+                shape=(1, n_sites),
+                dtype=np.float32,
+            ))
         else:
             beta_mat[i, locus_idx] = beta_vals
         
@@ -582,8 +592,10 @@ def build_anndata_streaming(
     # Assemble and return AnnData
     # ------------------------------------------------------------------
     if sparse:
-        from scipy.sparse import csr_matrix
-        X = csr_matrix(beta_mat)
+        from scipy.sparse import vstack
+        X = vstack(_sparse_rows, format="csr")
+        del _sparse_rows
+        gc.collect()
     else:
         X = beta_mat
     
@@ -597,7 +609,10 @@ def build_anndata_streaming(
         },
     )
 
-    del beta_mat, cov_mat, meth_mat, X
+    if sparse:
+        del cov_mat, meth_mat, X
+    else:
+        del beta_mat, cov_mat, meth_mat, X
     gc.collect()
 
     rss_after_adata = _get_rss_mb()
