@@ -1,3 +1,3 @@
 sample_id,path,group
-ctrl_d3_rep1,tests/raw_data/GSM9212480_CONTROLDONOR3_REP1_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz,control
-cd55_d3_rep1,tests/raw_data/GSM9212482_CD55DONOR3_REP1_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz,cd55
+ctrl_d3_rep1,raw_data/GSM9212480_CONTROLDONOR3_REP1_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz,control
+cd55_d3_rep1,raw_data/GSM9212482_CD55DONOR3_REP1_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz,cd55

@@ -229,12 +229,13 @@ def build_anndata_streaming(
     if regions_bed is not None:
         regions_df = merge_bed_intervals(read_bed_regions(regions_bed))
         if not regions_df.empty:
-            con.execute("CREATE TEMP TABLE _regions (chr VARCHAR, start INTEGER, end INTEGER);")
+            # NOTE: DuckDB treats END as a reserved keyword, so we quote it.
+            con.execute("CREATE TEMP TABLE _regions (chr VARCHAR, start INTEGER, \"end\" INTEGER);")
             con.register("_regions_df", regions_df)
             con.execute("INSERT INTO _regions SELECT * FROM _regions_df;")
             regions_filter_sql = (
                 "AND EXISTS (SELECT 1 FROM _regions r "
-                "WHERE r.chr = chr AND r.start <= start AND start < r.end)"
+                "WHERE r.chr = chr AND r.start <= start AND start < r.\"end\")"
             )
 
     def _cov_filter() -> str:
