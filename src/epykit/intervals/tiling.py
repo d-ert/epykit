@@ -451,6 +451,10 @@ def _overlap_polars_bio(
     tiles: pl.DataFrame,
 ) -> pl.DataFrame:
     """Overlap sites with tiles using polars-bio."""
+    # Cast chr to string to ensure type compatibility
+    sites = sites.with_columns(pl.col("chr").cast(pl.Utf8))
+    tiles = tiles.with_columns(pl.col("chr").cast(pl.Utf8))
+    
     result = pb.overlap(
         sites.rename({"chr": "chrom1", "start": "start1", "end": "end1"}),
         tiles.rename({"chr": "chrom2", "start": "start2", "end": "end2"}),
@@ -464,7 +468,10 @@ def _overlap_pure_polars(
     tiles: pl.DataFrame,
 ) -> pl.DataFrame:
     """Pure-Polars interval overlap using cross-join + filter."""
-    # For large datasets this is slow; polars-bio is strongly preferred
+    # Cast chr to string to ensure type compatibility
+    sites = sites.with_columns(pl.col("chr").cast(pl.Utf8))
+    tiles = tiles.with_columns(pl.col("chr").cast(pl.Utf8))
+    
     joined = sites.join(tiles, on="chr", how="inner", suffix="_tile")
     overlapping = joined.filter(
         (pl.col("start") < pl.col("end_tile"))

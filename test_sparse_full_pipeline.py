@@ -83,9 +83,9 @@ def run_pipeline():
             min_coverage=10,
             max_coverage=500,
             join_type="outer",
-            duckdb_memory_limit="10GB",
+            duckdb_memory_limit="14GB",
             duckdb_threads=3,
-            regions_bed="test_regions_sparse.bed",
+            #regions_bed="test_regions_sparse.bed",
             sparse=True,  # <-- SPARSE MODE
         )
         elapsed = time.time() - t0
@@ -146,30 +146,28 @@ def run_pipeline():
         results = calculate_diff_meth(
             mdata_cpg,
             treatment_col="group",
-            treatment_val="cd55",
-            control_val="control",
-            method="glm",  # Logistic GLM with LRT
-            fdr_threshold=0.05,
+            test="glm",  # Logistic GLM with LRT
+            fdr_method="BH",  # Benjamini-Hochberg FDR correction
         )
         elapsed = time.time() - t0
         
         # Extract key results
-        n_sig = (results["padj"] < 0.05).sum()
+        n_sig = (results["qvalue"] < 0.05).sum()
         
         log_msg("4/DMC", f"✓ Testing complete in {elapsed:.1f}s", level="OK")
         log_msg("4/DMC", f"  Total sites tested: {len(results)}", level="OK")
-        log_msg("4/DMC", f"  Significant (padj < 0.05): {n_sig}", level="OK")
+        log_msg("4/DMC", f"  Significant (qvalue < 0.05): {n_sig}", level="OK")
         log_msg("4/DMC", f"  Columns: {list(results.columns)}", level="OK")
         
         # Show top hits
-        top_hyper = results.nlargest(3, "beta_diff")[["chrom", "start", "beta_diff", "padj"]]
-        top_hypo = results.nsmallest(3, "beta_diff")[["chrom", "start", "beta_diff", "padj"]]
+        top_hyper = results.nlargest(3, "mean_diff")[["chr", "start", "mean_diff", "qvalue"]]
+        top_hypo = results.nsmallest(3, "mean_diff")[["chr", "start", "mean_diff", "qvalue"]]
         log_msg("4/DMC", f"  Top hyper-methylated:", level="OK")
         for idx, row in top_hyper.iterrows():
-            log_msg("4/DMC", f"    {row['chrom']}:{row['start']} Δβ={row['beta_diff']:.3f} p={row['padj']:.2e}", level="OK")
+            log_msg("4/DMC", f"    {row['chr']}:{row['start']} Δβ={row['mean_diff']:.3f} q={row['qvalue']:.2e}", level="OK")
         log_msg("4/DMC", f"  Top hypo-methylated:", level="OK")
         for idx, row in top_hypo.iterrows():
-            log_msg("4/DMC", f"    {row['chrom']}:{row['start']} Δβ={row['beta_diff']:.3f} p={row['padj']:.2e}", level="OK")
+            log_msg("4/DMC", f"    {row['chr']}:{row['start']} Δβ={row['mean_diff']:.3f} q={row['qvalue']:.2e}", level="OK")
         
     except Exception as e:
         log_msg("4/DMC", f"✗ FAILED: {e}", level="ERR")
@@ -191,7 +189,7 @@ def run_pipeline():
     t0 = time.time()
     try:
         # Select significant sites and merge into regions
-        sig_results = results[results["padj"] < 0.05].copy()
+        sig_results = results[results["qvalue"] < 0.05].copy()
         
         if len(sig_results) > 0:
             dmrs = merge_dmrs(
@@ -213,9 +211,9 @@ def run_pipeline():
             # Show top DMRs
             top_dmrs = dmrs.nlargest(3, "med_beta_diff")
             for idx, row in top_dmrs.iterrows():
-                log_msg("5/DMR", f"    {row['chrom']}:{row['start']}-{row['end']} ({row['n_cpg']} CpGs) Δβ={row['med_beta_diff']:.3f}", level="OK")
+                log_msg("5/DMR", f"    {row['chr']}:{row['start']}-{row['end']} ({row['n_cpg']} CpGs) Δβ={row['med_beta_diff']:.3f}", level="OK")
         else:
-            log_msg("5/DMR", f"No significant sites to merge (padj < 0.05)", level="WARN")
+            log_msg("5/DMR", f"No significant sites to merge (qvalue < 0.05)", level="WARN")
             dmrs = None
         
     except Exception as e:
@@ -287,8 +285,8 @@ def run_pipeline():
     log_msg("8/SUM", f"After QC:  {mdata_cpg.adata.n_obs} samples × {mdata_cpg.adata.n_vars} sites (CpG only)", level="OK")
     
     if "results" in locals():
-        n_sig = (results["padj"] < 0.05).sum()
-        log_msg("8/SUM", f"DMC: {len(results)} tested → {n_sig} significant (padj < 0.05)", level="OK")
+        n_sig = (results["qvalue"] < 0.05).sum()
+        log_msg("8/SUM", f"DMC: {len(results)} tested → {n_sig} significant (qvalue < 0.05)", level="OK")
     
     if dmrs is not None:
         log_msg("8/SUM", f"DMR: {len(dmrs)} regions merged from significant sites", level="OK")

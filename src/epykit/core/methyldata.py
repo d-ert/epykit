@@ -96,7 +96,10 @@ class MethylData:
         Values range from 0 to 100.
         NaN indicates a site with no coverage in that sample.
         """
-        return np.asarray(self._adata.X)
+        X = self._adata.X
+        if hasattr(X, 'toarray'):  # Sparse matrix (CSR/CSC)
+            return X.toarray()
+        return np.asarray(X)
 
     @property
     def coverage(self) -> np.ndarray:
@@ -105,7 +108,10 @@ class MethylData:
         Shape: ``(n_samples, n_sites)`` — int32.
         Zero indicates no coverage.
         """
-        return np.asarray(self._adata.layers["coverage"])
+        cov = self._adata.layers["coverage"]
+        if hasattr(cov, 'toarray'):  # Sparse matrix
+            return cov.toarray()
+        return np.asarray(cov)
 
     @property
     def methylated(self) -> np.ndarray:
@@ -113,7 +119,10 @@ class MethylData:
 
         Shape: ``(n_samples, n_sites)`` — int32.
         """
-        return np.asarray(self._adata.layers["methylated_counts"])
+        meth = self._adata.layers["methylated_counts"]
+        if hasattr(meth, 'toarray'):  # Sparse matrix
+            return meth.toarray()
+        return np.asarray(meth)
 
     @property
     def unmethylated(self) -> np.ndarray:
