@@ -84,7 +84,7 @@ def run_pipeline():
             max_coverage=500,
             join_type="inner",
             duckdb_memory_limit="14GB",
-            duckdb_threads=1,
+            duckdb_threads=3,
             #regions_bed="test_regions_sparse.bed",
             sparse=True,  # <-- SPARSE MODE
         )
@@ -142,12 +142,14 @@ def run_pipeline():
     
     t0 = time.time()
     try:
-        # Run GLM-based test: cd55 vs control
+        # Run limma-style test (fast M-value LM + eBayes): cd55 vs control
         results = calculate_diff_meth(
             mdata_cpg,
             treatment_col="group",
-            test="glm",  # Logistic GLM with LRT
+            test="limma",  # Fast limma-style M-value model
             fdr_method="BH",  # Benjamini-Hochberg FDR correction
+            limma_chunk_size=100000,
+            limma_alpha=0.5,
         )
         elapsed = time.time() - t0
         
@@ -194,13 +196,13 @@ def run_pipeline():
         if len(sig_results) > 0:
             dmrs = merge_dmrs(
                 sig_results,
-                min_cpg=2,  # Minimum 2 CpGs per region
+                min_sites=2,  # Minimum 2 CpGs per region
                 max_gap=300,  # Maximum 300 bp gap between sites
             )
             elapsed = time.time() - t0
             
-            n_hyper = (dmrs["med_beta_diff"] > 0).sum()
-            n_hypo = (dmrs["med_beta_diff"] <= 0).sum()
+            n_hyper = (dmrs["mean_diff"] > 0).sum()
+            n_hypo = (dmrs["mean_diff"] <= 0).sum()
             
             log_msg("5/DMR", f"✓ DMR merging complete in {elapsed:.1f}s", level="OK")
             log_msg("5/DMR", f"  Identified {len(dmrs)} DMRs:", level="OK")
@@ -209,9 +211,9 @@ def run_pipeline():
             log_msg("5/DMR", f"  Columns: {list(dmrs.columns)}", level="OK")
             
             # Show top DMRs
-            top_dmrs = dmrs.nlargest(3, "med_beta_diff")
+            top_dmrs = dmrs.nlargest(3, "mean_diff")
             for idx, row in top_dmrs.iterrows():
-                log_msg("5/DMR", f"    {row['chr']}:{row['start']}-{row['end']} ({row['n_cpg']} CpGs) Δβ={row['med_beta_diff']:.3f}", level="OK")
+                log_msg("5/DMR", f"    {row['chr']}:{row['start']}-{row['end']} ({row['n_cpgs']} CpGs) Δβ={row['mean_diff']:.3f}", level="OK")
         else:
             log_msg("5/DMR", f"No significant sites to merge (qvalue < 0.05)", level="WARN")
             dmrs = None

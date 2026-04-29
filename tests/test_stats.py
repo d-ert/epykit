@@ -128,12 +128,32 @@ class TestCalculateDiffMeth:
         )
         assert "log2_odds_ratio" in result.columns
 
+    def test_auto_selects_limma_for_replicates(self, toy_mdata):
+        """Auto should use limma when there are replicates."""
+        from epykit.stats import calculate_diff_meth
+
+        result = calculate_diff_meth(
+            toy_mdata, treatment_col="group", test="auto"
+        )
+        assert "log2_odds_ratio" not in result.columns
+        assert (result["pvalue"] >= 0).all()
+
     def test_glm_test_runs(self, toy_mdata):
         """GLM test should run and return valid p-values."""
         from epykit.stats import calculate_diff_meth
 
         result = calculate_diff_meth(
             toy_mdata, treatment_col="group", test="glm", overdispersion=False
+        )
+        assert len(result) == toy_mdata.n_sites
+        assert (result["pvalue"] >= 0).all()
+
+    def test_limma_test_runs(self, toy_mdata):
+        """Limma test should run and return valid p-values."""
+        from epykit.stats import calculate_diff_meth
+
+        result = calculate_diff_meth(
+            toy_mdata, treatment_col="group", test="limma"
         )
         assert len(result) == toy_mdata.n_sites
         assert (result["pvalue"] >= 0).all()

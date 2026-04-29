@@ -114,6 +114,15 @@ class MethylData:
         return np.asarray(cov)
 
     @property
+    def coverage_layer(self):
+        """Coverage layer without densifying (sparse-safe).
+
+        Returns the underlying AnnData layer so callers can slice and
+        densify in chunks. This is critical for genome-scale analyses.
+        """
+        return self._adata.layers["coverage"]
+
+    @property
     def methylated(self) -> np.ndarray:
         """Methylated read count matrix.
 
@@ -123,6 +132,11 @@ class MethylData:
         if hasattr(meth, 'toarray'):  # Sparse matrix
             return meth.toarray()
         return np.asarray(meth)
+
+    @property
+    def methylated_layer(self):
+        """Methylated counts layer without densifying (sparse-safe)."""
+        return self._adata.layers["methylated_counts"]
 
     @property
     def unmethylated(self) -> np.ndarray:
