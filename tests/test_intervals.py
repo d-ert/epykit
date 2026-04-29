@@ -13,6 +13,7 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.sparse import csr_matrix
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +140,56 @@ class TestTileCounts:
         orig_total = np.asarray(small_adata.layers["coverage"]).sum()
         tile_total = np.asarray(result.layers["coverage"]).sum()
         assert tile_total == orig_total
+
+    def test_chunk_size_invariance(self, small_adata):
+        """Chunked aggregation must be invariant to chunk size."""
+        from epykit.intervals.tiling import tile_counts
+
+        out_small = tile_counts(
+            small_adata,
+            window=1000,
+            step=1000,
+            chunk_size_sites=2,
+        )
+        out_large = tile_counts(
+            small_adata,
+            window=1000,
+            step=1000,
+            chunk_size_sites=1000,
+        )
+
+        assert out_small.n_vars == out_large.n_vars
+        assert np.array_equal(
+            np.asarray(out_small.layers["coverage"]),
+            np.asarray(out_large.layers["coverage"]),
+        )
+        assert np.array_equal(
+            np.asarray(out_small.layers["methylated_counts"]),
+            np.asarray(out_large.layers["methylated_counts"]),
+        )
+
+    def test_sparse_layers_match_dense(self, small_adata):
+        """Sparse input layers should produce the same tiled counts as dense."""
+        from epykit.intervals.tiling import tile_counts
+
+        dense_out = tile_counts(small_adata, window=1000, step=1000, chunk_size_sites=2)
+
+        sparse_adata = small_adata.copy()
+        sparse_adata.layers["coverage"] = csr_matrix(sparse_adata.layers["coverage"])
+        sparse_adata.layers["methylated_counts"] = csr_matrix(
+            sparse_adata.layers["methylated_counts"]
+        )
+        sparse_out = tile_counts(sparse_adata, window=1000, step=1000, chunk_size_sites=2)
+
+        assert sparse_out.n_vars == dense_out.n_vars
+        assert np.array_equal(
+            np.asarray(dense_out.layers["coverage"]),
+            np.asarray(sparse_out.layers["coverage"]),
+        )
+        assert np.array_equal(
+            np.asarray(dense_out.layers["methylated_counts"]),
+            np.asarray(sparse_out.layers["methylated_counts"]),
+        )
 
 
 # ---------------------------------------------------------------------------

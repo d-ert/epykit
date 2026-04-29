@@ -25,6 +25,7 @@ from typing import Union
 import numpy as np
 import pandas as pd
 import polars as pl
+from scipy.sparse import csr_matrix, issparse
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ def tile_counts(
     window: int = 1000,
     step: int | None = None,
     min_cpgs_per_window: int = 1,
+    chunk_size_sites: int = 200000,
 ) -> "ad.AnnData":
     """Bin CpG sites into fixed-size genomic windows.
 
@@ -77,6 +79,10 @@ def tile_counts(
     min_cpgs_per_window:
         Minimum number of CpG sites required to include a window in the
         output.  Default: 1 (keep all windows with at least 1 site).
+    chunk_size_sites:
+        Number of site-to-tile links processed per aggregation chunk.
+        Smaller values reduce peak memory at the cost of more chunk
+        iterations.  Default: 200000.
 
     Returns
     -------
@@ -96,13 +102,14 @@ def tile_counts(
     """
     if step is None:
         step = window
+    if chunk_size_sites <= 0:
+        raise ValueError("chunk_size_sites must be > 0")
 
     # Extract site coordinates from var
-    # Dynamically get the index name (could be "locus_key", "locus_id", or other)
-    idx_name = adata.var.index.name or "index"
-    sites_pl = pl.from_pandas(
-        adata.var[["chr", "start", "end"]].reset_index()
-    ).rename({idx_name: "_site_key"})
+    # Keep integer site indices for memory-efficient mapping.
+    sites_pd = adata.var[["chr", "start", "end"]].reset_index(drop=True)
+    sites_pd["_site_idx"] = np.arange(adata.n_vars, dtype=np.int64)
+    sites_pl = pl.from_pandas(sites_pd)
 
     # --- Generate tiles ---
     # Get chromosome sizes from the data (max end position per chr)
@@ -117,61 +124,118 @@ def tile_counts(
         "tile_counts(window=%d, step=%d): %d tiles generated",
         window, step, len(tiles),
     )
+    if (not _HAS_POLARS_BIO) and adata.n_vars > 1_000_000:
+        logger.warning(
+            "polars-bio is not installed; pure-Polars overlap may be slow "
+            "for %d sites. Install polars-bio for large datasets.",
+            adata.n_vars,
+        )
 
     # --- Overlap sites with tiles ---
     if _HAS_POLARS_BIO:
-        site_to_tile = _overlap_polars_bio(sites_pl, tiles)
+        site_to_tile = _overlap_tiles_polars_bio(sites_pl, tiles)
     else:
-        site_to_tile = _overlap_pure_polars(sites_pl, tiles)
+        site_to_tile = _overlap_tiles_pure_polars(sites_pl, tiles)
 
-    if len(site_to_tile) == 0:
+    # polars-bio may return LazyFrame depending on version/config.
+    if isinstance(site_to_tile, pl.LazyFrame):
+        site_to_tile = site_to_tile.collect()
+
+    if site_to_tile.is_empty():
         logger.warning("No CpG sites overlap with any tile. Returning empty AnnData.")
         return _empty_anndata(adata)
 
-    # --- Filter tiles by min_cpgs ---
-    tile_cpg_counts = site_to_tile.group_by("_tile_key").agg(
-        pl.count().alias("n_cpgs")
+    # Stable ordering makes output deterministic across overlap backends.
+    site_to_tile = site_to_tile.sort(["_site_idx", "_tile_idx"])
+
+    # --- Filter tiles by min_cpgs (before matrix allocation) ---
+    tile_cpg_counts = site_to_tile.group_by("_tile_idx").agg(
+        pl.len().alias("n_cpgs")
     )
     valid_tiles = tile_cpg_counts.filter(pl.col("n_cpgs") >= min_cpgs_per_window)
-    site_to_tile = site_to_tile.join(valid_tiles.select("_tile_key"), on="_tile_key", how="inner")
+    if valid_tiles.is_empty():
+        logger.warning(
+            "No tiles pass min_cpgs_per_window=%d. Returning empty AnnData.",
+            min_cpgs_per_window,
+        )
+        return _empty_anndata(adata)
 
-    # Map site index: locus_key -> position index in adata.var
-    site_idx_map = {k: i for i, k in enumerate(adata.var_names)}
-    site_to_tile = site_to_tile.with_columns(
-        pl.col("_site_key").map_elements(
-            lambda k: site_idx_map.get(k, -1), return_dtype=pl.Int32
-        ).alias("_site_idx")
-    ).filter(pl.col("_site_idx") >= 0)
+    site_to_tile = site_to_tile.join(
+        valid_tiles.select("_tile_idx"),
+        on="_tile_idx",
+        how="inner",
+    )
 
     # Get unique tiles sorted by genomic position
     unique_tiles = (
         tiles
-        .join(valid_tiles.select("_tile_key"), on="_tile_key", how="inner")
+        .join(valid_tiles.select("_tile_idx"), on="_tile_idx", how="inner")
         .sort(["chr", "start"])
+        .with_row_index("_tile_col")
     )
 
-    tile_idx_map = {k: i for i, k in enumerate(unique_tiles["_tile_key"].to_list())}
-    n_tiles = len(unique_tiles)
+    site_to_tile = site_to_tile.join(
+        unique_tiles.select(["_tile_idx", "_tile_col"]),
+        on="_tile_idx",
+        how="inner",
+    ).select(["_site_idx", "_tile_col"]).sort(["_site_idx", "_tile_col"])
+
+    n_tiles = unique_tiles.height
     n_samples = adata.n_obs
 
-    # --- Aggregate matrices ---
-    cov_arr = np.asarray(adata.layers["coverage"])      # (n_samples, n_sites)
-    meth_arr = np.asarray(adata.layers["methylated_counts"])
+    # --- Aggregate matrices (chunked, sparse-safe) ---
+    cov_layer = adata.layers["coverage"]
+    meth_layer = adata.layers["methylated_counts"]
+    sparse_input = issparse(cov_layer) and issparse(meth_layer)
 
-    tile_cov = np.zeros((n_samples, n_tiles), dtype=np.int32)
-    tile_meth = np.zeros((n_samples, n_tiles), dtype=np.int32)
+    if sparse_input:
+        cov_src = cov_layer.tocsc()
+        meth_src = meth_layer.tocsc()
+    else:
+        cov_src = np.asarray(cov_layer)
+        meth_src = np.asarray(meth_layer)
 
-    s2t = site_to_tile.select(["_site_idx", "_tile_key"]).to_pandas()
-    site_indices = s2t["_site_idx"].to_numpy(dtype=np.int32)
-    tile_indices = s2t["_tile_key"].map(tile_idx_map).to_numpy(dtype=np.int32)
-    valid = tile_indices >= 0
+    tile_cov = np.zeros((n_samples, n_tiles), dtype=np.int64)
+    tile_meth = np.zeros((n_samples, n_tiles), dtype=np.int64)
 
-    if valid.any():
-        for t in np.unique(tile_indices[valid]):
-            mask = (tile_indices == t) & valid
-            cols = site_indices[mask]
-            tile_cov[:, t] = cov_arr[:, cols].sum(axis=1)
-            tile_meth[:, t] = meth_arr[:, cols].sum(axis=1)
+    links = site_to_tile.to_numpy()
+    n_links = links.shape[0]
+
+    for start_idx in range(0, n_links, chunk_size_sites):
+        end_idx = min(start_idx + chunk_size_sites, n_links)
+        chunk = links[start_idx:end_idx]
+        site_idx_chunk = chunk[:, 0].astype(np.int64, copy=False)
+        tile_idx_chunk = chunk[:, 1].astype(np.int64, copy=False)
+
+        if sparse_input:
+            cov_chunk = cov_src[:, site_idx_chunk]
+            meth_chunk = meth_src[:, site_idx_chunk]
+
+            indicator = csr_matrix(
+                (
+                    np.ones(tile_idx_chunk.shape[0], dtype=np.int8),
+                    (np.arange(tile_idx_chunk.shape[0]), tile_idx_chunk),
+                ),
+                shape=(tile_idx_chunk.shape[0], n_tiles),
+            )
+
+            tile_cov += (cov_chunk @ indicator).toarray()
+            tile_meth += (meth_chunk @ indicator).toarray()
+        else:
+            cov_chunk = cov_src[:, site_idx_chunk]
+            meth_chunk = meth_src[:, site_idx_chunk]
+
+            cov_sum = np.vstack([
+                np.bincount(tile_idx_chunk, weights=row, minlength=n_tiles)
+                for row in cov_chunk
+            ])
+            meth_sum = np.vstack([
+                np.bincount(tile_idx_chunk, weights=row, minlength=n_tiles)
+                for row in meth_chunk
+            ])
+
+            tile_cov += cov_sum.astype(np.int64, copy=False)
+            tile_meth += meth_sum.astype(np.int64, copy=False)
 
     # Compute beta for tiles
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -184,10 +248,18 @@ def tile_counts(
     # --- Build var DataFrame for tiles ---
     tile_pd = unique_tiles.to_pandas()
     n_cpg_map = dict(zip(
-        tile_cpg_counts["_tile_key"].to_list(),
-        tile_cpg_counts["n_cpgs"].to_list(),
+        valid_tiles["_tile_idx"].to_list(),
+        valid_tiles["n_cpgs"].to_list(),
     ))
-    tile_pd["n_cpgs"] = tile_pd["_tile_key"].map(n_cpg_map).fillna(0).astype(int)
+    tile_pd["n_cpgs"] = tile_pd["_tile_idx"].map(n_cpg_map).fillna(0).astype(int)
+    tile_pd["_tile_key"] = (
+        tile_pd["chr"].astype(str)
+        + ":"
+        + tile_pd["start"].astype(str)
+        + "-"
+        + tile_pd["end"].astype(str)
+        + ":*"
+    )
     tile_pd = tile_pd.set_index("_tile_key")
     tile_pd.index.name = "locus_key"
 
@@ -197,8 +269,8 @@ def tile_counts(
         obs=adata.obs.copy(),
         var=tile_pd[["chr", "start", "end", "n_cpgs"]],
         layers={
-            "coverage": tile_cov,
-            "methylated_counts": tile_meth,
+            "coverage": tile_cov.astype(np.int32, copy=False),
+            "methylated_counts": tile_meth.astype(np.int32, copy=False),
         },
     )
 
@@ -289,10 +361,18 @@ def annotate_features(
 
     if _HAS_POLARS_BIO:
         overlap = pb.overlap(
-            sites.rename({"chr": "chrom1", "start": "start1", "end": "end1"}),
-            bed.rename({"chr": "chrom2", "start": "start2", "end": "end2"}),
+            sites.rename({"chr": "chrom"}),
+            bed.rename({"chr": "chrom"}),
             suffixes=("", "_feat"),
+            output_type="polars.DataFrame",
         )
+        rename_map: dict[str, str] = {}
+        if "_site_key_1" in overlap.columns:
+            rename_map["_site_key_1"] = "_site_key"
+        if "feature_name_feat" in overlap.columns:
+            rename_map["feature_name_feat"] = "feature_name"
+        if rename_map:
+            overlap = overlap.rename(rename_map)
         overlap = overlap.select(["_site_key", "feature_name"])
     else:
         overlap = _overlap_annotation_pure_polars(sites, bed)
@@ -434,16 +514,81 @@ def _generate_tiles(
     step: int,
 ) -> pl.DataFrame:
     """Generate genomic tiles from chromosome sizes."""
-    tiles_list = []
-    for row in chr_sizes.iter_rows(named=True):
+    parts: list[pl.DataFrame] = []
+    tile_offset = 0
+
+    for row in chr_sizes.sort("chr").iter_rows(named=True):
         chrom = row["chr"]
-        size = row["chr_size"]
-        starts = range(0, size, step)
-        for s in starts:
-            e = min(s + window, size)
-            tile_key = f"{chrom}:{s}-{e}:*"
-            tiles_list.append({"chr": chrom, "start": s, "end": e, "_tile_key": tile_key})
-    return pl.DataFrame(tiles_list)
+        size = int(row["chr_size"])
+        starts = np.arange(0, size, step, dtype=np.int64)
+        ends = np.minimum(starts + window, size).astype(np.int64)
+        n_chr_tiles = starts.shape[0]
+
+        parts.append(
+            pl.DataFrame(
+                {
+                    "chr": np.repeat(chrom, n_chr_tiles),
+                    "start": starts,
+                    "end": ends,
+                    "_tile_idx": np.arange(
+                        tile_offset,
+                        tile_offset + n_chr_tiles,
+                        dtype=np.int64,
+                    ),
+                }
+            )
+        )
+        tile_offset += n_chr_tiles
+
+    if not parts:
+        return pl.DataFrame(schema={"chr": pl.Utf8, "start": pl.Int64, "end": pl.Int64, "_tile_idx": pl.Int64})
+
+    return pl.concat(parts, how="vertical_relaxed")
+
+
+def _overlap_tiles_polars_bio(
+    sites: pl.DataFrame,
+    tiles: pl.DataFrame,
+) -> pl.DataFrame:
+    """Overlap sites with tiles and return integer index mapping."""
+    sites = sites.with_columns(pl.col("chr").cast(pl.Utf8)).rename({"chr": "chrom"})
+    tiles = tiles.with_columns(pl.col("chr").cast(pl.Utf8)).rename({"chr": "chrom"})
+
+    result = pb.overlap(
+        sites.rename({"start": "start", "end": "end"}),
+        tiles.rename({"start": "start", "end": "end"}),
+        suffixes=("", "_tile"),
+        output_type="polars.DataFrame",
+    )
+
+    # polars-bio 0.30 suffixes all rhs columns, so _tile_idx -> _tile_idx_tile.
+    # older versions used _tile_idx or _tile_idx_2; normalize to _tile_idx.
+    rename_map: dict[str, str] = {}
+    if "_site_idx_1" in result.columns:
+        rename_map["_site_idx_1"] = "_site_idx"
+    if "_tile_idx_tile" in result.columns:
+        rename_map["_tile_idx_tile"] = "_tile_idx"
+    if "_tile_idx_2" in result.columns:
+        rename_map["_tile_idx_2"] = "_tile_idx"
+    if rename_map:
+        result = result.rename(rename_map)
+    return result.select(["_site_idx", "_tile_idx"])
+
+
+def _overlap_tiles_pure_polars(
+    sites: pl.DataFrame,
+    tiles: pl.DataFrame,
+) -> pl.DataFrame:
+    """Pure-Polars overlap for tile mapping with integer indices only."""
+    sites = sites.with_columns(pl.col("chr").cast(pl.Utf8))
+    tiles = tiles.with_columns(pl.col("chr").cast(pl.Utf8))
+
+    joined = sites.join(tiles, on="chr", how="inner", suffix="_tile")
+    overlapping = joined.filter(
+        (pl.col("start") < pl.col("end_tile"))
+        & (pl.col("end") > pl.col("start_tile"))
+    )
+    return overlapping.select(["_site_idx", "_tile_idx"])
 
 
 def _overlap_polars_bio(
@@ -452,14 +597,33 @@ def _overlap_polars_bio(
 ) -> pl.DataFrame:
     """Overlap sites with tiles using polars-bio."""
     # Cast chr to string to ensure type compatibility
-    sites = sites.with_columns(pl.col("chr").cast(pl.Utf8))
-    tiles = tiles.with_columns(pl.col("chr").cast(pl.Utf8))
-    
+    sites = sites.with_columns(pl.col("chr").cast(pl.Utf8)).rename({"chr": "chrom"})
+    tiles = tiles.with_columns(pl.col("chr").cast(pl.Utf8)).rename({"chr": "chrom"})
+
     result = pb.overlap(
-        sites.rename({"chr": "chrom1", "start": "start1", "end": "end1"}),
-        tiles.rename({"chr": "chrom2", "start": "start2", "end": "end2"}),
+        sites,
+        tiles,
         suffixes=("", "_tile"),
+        output_type="polars.DataFrame",
     )
+
+    # Normalize site key name if polars-bio added a suffix
+    if "_site_key_1" in result.columns:
+        result = result.rename({"_site_key_1": "_site_key"})
+
+    # Rebuild tile key from tile coordinates (polars-bio does not carry _tile_key)
+    if "_tile_key" not in result.columns:
+        result = result.with_columns(
+            (
+                pl.col("chrom_tile")
+                + ":"
+                + pl.col("start_tile").cast(pl.Utf8)
+                + "-"
+                + pl.col("end_tile").cast(pl.Utf8)
+                + ":*"
+            ).alias("_tile_key")
+        )
+
     return result.select(["_site_key", "_tile_key"])
 
 
