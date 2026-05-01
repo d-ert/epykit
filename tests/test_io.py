@@ -265,6 +265,42 @@ class TestReadSamples:
         assert adata.var.index.name == "locus_key_index"
 
 
+class TestReadSamplesToParquet:
+    """Smoke tests for the Parquet-native sample-sheet conversion path."""
+
+    def test_parquet_conversion_and_readback(self, sample_sheet_dir, tmp_path):
+        from epykit.core import ParquetMethylStore
+        from epykit.io import read_samples_to_parquet
+
+        sheet = sample_sheet_dir / "sample_sheet.csv"
+        out_dir = tmp_path / "methylstore"
+
+        read_samples_to_parquet(
+            sheet,
+            out_dir,
+            n_workers=1,
+            min_coverage=10,
+            chunksize=100000,
+        )
+
+        store = ParquetMethylStore(out_dir)
+        assert sorted(store.samples()) == ["ctrl_1", "treat_1"]
+        assert "chr1" in store.chromosomes()
+
+        chrom_df = store.load_chromosome("chr1", samples=["ctrl_1"])
+        assert isinstance(chrom_df, pl.DataFrame)
+        assert len(chrom_df) > 0
+        assert set(chrom_df.columns) == {
+            "chrom",
+            "pos",
+            "strand",
+            "N_meth",
+            "N_unmeth",
+            "coverage",
+            "sample",
+        }
+
+
 class TestRegionsBed:
     """Tests for regions_bed filtering across engines."""
 

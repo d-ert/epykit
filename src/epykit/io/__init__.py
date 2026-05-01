@@ -26,7 +26,11 @@ from epykit.io.anndata_builder_duckdb import (
 )
 from epykit.io.bismark import read_bismark_coverage, read_bismark_cx_report
 from epykit.io.generic import read_bedgraph, read_generic_methylation
-from epykit.io.sample_sheet import read_samples
+from epykit.io.parquet_converter import (
+    convert_sample,
+    convert_sample_sheet,
+)
+from epykit.io.sample_sheet import read_samples, read_samples_to_parquet
 
 __all__ = [
     # Bismark
@@ -37,6 +41,10 @@ __all__ = [
     "read_generic_methylation",
     # Multi-sample
     "read_samples",
+    "read_samples_to_parquet",
+    # Parquet conversion (new)
+    "convert_sample",
+    "convert_sample_sheet",
     # DuckDB streaming (memory-efficient for large cohorts)
     "build_anndata_streaming",
     "read_samples_streaming",

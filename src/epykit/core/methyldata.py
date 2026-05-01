@@ -89,27 +89,36 @@ class MethylData:
         return self._adata
 
     @property
-    def beta(self) -> np.ndarray:
+    def beta(self):
         """Beta-value matrix (methylation %).
 
         Shape: ``(n_samples, n_sites)`` — float32.
         Values range from 0 to 100.
-        NaN indicates a site with no coverage in that sample.
+        Returns sparse or dense matrix depending on how AnnData was built.
         """
+        return self._adata.X
+
+    def beta_dense(self) -> np.ndarray:
+        """Return beta values as a dense NumPy array (explicit densify)."""
         X = self._adata.X
-        if hasattr(X, 'toarray'):  # Sparse matrix (CSR/CSC)
+        if hasattr(X, "toarray"):
             return X.toarray()
         return np.asarray(X)
 
     @property
-    def coverage(self) -> np.ndarray:
+    def coverage(self):
         """Total read coverage matrix.
 
         Shape: ``(n_samples, n_sites)`` — int32.
         Zero indicates no coverage.
+        Returns sparse or dense matrix depending on AnnData storage.
         """
+        return self._adata.layers["coverage"]
+
+    def coverage_dense(self) -> np.ndarray:
+        """Return coverage as a dense NumPy array (explicit densify)."""
         cov = self._adata.layers["coverage"]
-        if hasattr(cov, 'toarray'):  # Sparse matrix
+        if hasattr(cov, "toarray"):
             return cov.toarray()
         return np.asarray(cov)
 
@@ -123,13 +132,18 @@ class MethylData:
         return self._adata.layers["coverage"]
 
     @property
-    def methylated(self) -> np.ndarray:
+    def methylated(self):
         """Methylated read count matrix.
 
         Shape: ``(n_samples, n_sites)`` — int32.
+        Returns sparse or dense matrix depending on AnnData storage.
         """
+        return self._adata.layers["methylated_counts"]
+
+    def methylated_dense(self) -> np.ndarray:
+        """Return methylated counts as a dense NumPy array (explicit densify)."""
         meth = self._adata.layers["methylated_counts"]
-        if hasattr(meth, 'toarray'):  # Sparse matrix
+        if hasattr(meth, "toarray"):
             return meth.toarray()
         return np.asarray(meth)
 
@@ -220,17 +234,24 @@ class MethylData:
         >>> mdata_filtered = mdata.filter_coverage(5, 500)
         >>> mdata_strict = mdata.filter_coverage(10, require_all_samples=True)
         """
-        cov = self.coverage  # (n_samples, n_sites)
-
-        if require_all_samples:
-            # Keep sites where ALL samples meet min_cov
-            mask = np.all(cov >= min_cov, axis=0)
+        cov = self.coverage_layer  # (n_samples, n_sites)
+        if hasattr(cov, "max") and hasattr(cov, "min"):
+            if require_all_samples:
+                min_mask = cov.min(axis=0) >= min_cov
+            else:
+                min_mask = cov.max(axis=0) >= min_cov
+            if max_cov is not None:
+                max_mask = cov.max(axis=0) <= max_cov
+                min_mask = min_mask & max_mask
+            mask = np.asarray(min_mask).ravel().astype(bool)
         else:
-            # Keep sites where ANY sample meets min_cov
-            mask = np.any(cov >= min_cov, axis=0)
+            if require_all_samples:
+                mask = np.all(cov >= min_cov, axis=0)
+            else:
+                mask = np.any(cov >= min_cov, axis=0)
 
-        if max_cov is not None:
-            mask = mask & np.all(cov <= max_cov, axis=0)
+            if max_cov is not None:
+                mask = mask & np.all(cov <= max_cov, axis=0)
 
         n_before = self.n_sites
         n_kept = int(mask.sum())
@@ -330,7 +351,7 @@ class MethylData:
             logger.info("unite(type='union'): returning all %d sites", self.n_sites)
             return MethylData(self._adata.copy())
 
-        cov = self.coverage  # (n_samples, n_sites)
+        cov = self.coverage_layer  # (n_samples, n_sites)
 
         if treatment_col is not None and min_per_group is not None:
             # Per-group coverage mask
@@ -340,7 +361,7 @@ class MethylData:
                 grp_idx = self._adata.obs[treatment_col] == grp
                 grp_cov = cov[grp_idx.values, :]
                 n_covered = (grp_cov > 0).sum(axis=0)
-                mask &= n_covered >= min_per_group
+                mask &= np.asarray(n_covered >= min_per_group).ravel()
         else:
             # All samples must have coverage > 0
             mask = np.all(cov > 0, axis=0)
@@ -370,7 +391,7 @@ class MethylData:
             ``pct_sites_covered``, ``n_sites_min1``.
             Index: sample IDs.
         """
-        cov = self.coverage
+        cov = self.coverage_dense()
         total_sites = self.n_sites
         stats = []
         for i, sid in enumerate(self.obs_names):
@@ -396,13 +417,13 @@ class MethylData:
             Columns: ``global_beta_mean``, ``global_beta_median``,
             ``total_methylated``, ``total_coverage``.
         """
-        meth = self.methylated
-        cov = self.coverage
+        meth = self.methylated_dense()
+        cov = self.coverage_dense()
         records = []
         for i, sid in enumerate(self.obs_names):
             total_m = int(meth[i, :].sum())
             total_c = int(cov[i, :].sum())
-            row_beta = self.beta[i, :]
+            row_beta = self.beta_dense()[i, :]
             row_beta_covered = row_beta[~np.isnan(row_beta)]
             records.append({
                 "sample_id": sid,

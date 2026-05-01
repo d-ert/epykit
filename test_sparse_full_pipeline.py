@@ -81,10 +81,10 @@ def run_pipeline():
             file_paths=file_paths,
             obs_metadata=obs_metadata,
             min_coverage=10,
-            max_coverage=500,
+            max_coverage=50,
             join_type="outer",
-            duckdb_memory_limit="14GB",
-            duckdb_threads=3,
+            duckdb_memory_limit="4GB",
+            duckdb_threads=1,
             #regions_bed="test_regions_sparse.bed",
             sparse=True,  # <-- SPARSE MODE
         )

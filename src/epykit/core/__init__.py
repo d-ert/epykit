@@ -12,5 +12,6 @@ Usage
 """
 
 from epykit.core.methyldata import MethylData
+from epykit.core.parquet_backend import ParquetMethylStore
 
-__all__ = ["MethylData"]
+__all__ = ["MethylData", "ParquetMethylStore"]

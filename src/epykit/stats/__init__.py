@@ -31,6 +31,10 @@ Master entry point
 """
 
 from epykit.stats.dmr import merge_dmrs
+from epykit.stats.dmr_processor_chromwise import (
+   calculate_diff_meth_chromwise,
+   process_chromosome,
+)
 from epykit.stats.tests import (
     calculate_diff_meth,
     fisher_exact_test,
@@ -43,5 +47,7 @@ __all__ = [
     "fisher_exact_test",
     "glm_lrt_test",
     "limma_ebayes_test",
+   "calculate_diff_meth_chromwise",
+   "process_chromosome",
     "merge_dmrs",
 ]

@@ -60,6 +60,218 @@ except ImportError:  # pragma: no cover
     )
 
 
+def _mean_beta_from_count_arrays(
+    meth_counts: np.ndarray,
+    cov_counts: np.ndarray,
+) -> np.ndarray:
+    """Mean beta per site from count arrays shaped (n_sites, n_samples)."""
+    meth = np.asarray(meth_counts, dtype=np.float64)
+    cov = np.asarray(cov_counts, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        beta = np.where(cov > 0, meth / cov * 100.0, np.nan)
+    return np.nanmean(beta, axis=1)
+
+
+def _mean_diff_from_count_arrays(
+    meth_counts_a: np.ndarray,
+    cov_counts_a: np.ndarray,
+    meth_counts_b: np.ndarray,
+    cov_counts_b: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return mean methylation for each group and the signed difference."""
+    mean_a = _mean_beta_from_count_arrays(meth_counts_a, cov_counts_a)
+    mean_b = _mean_beta_from_count_arrays(meth_counts_b, cov_counts_b)
+    return mean_b - mean_a, mean_a, mean_b
+
+
+def _fisher_exact_from_arrays(
+    meth_counts_a: np.ndarray,
+    cov_counts_a: np.ndarray,
+    meth_counts_b: np.ndarray,
+    cov_counts_b: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized Fisher's exact test on per-group count arrays."""
+    meth_a = np.asarray(meth_counts_a, dtype=np.int64).sum(axis=1)
+    cov_a = np.asarray(cov_counts_a, dtype=np.int64).sum(axis=1)
+    meth_b = np.asarray(meth_counts_b, dtype=np.int64).sum(axis=1)
+    cov_b = np.asarray(cov_counts_b, dtype=np.int64).sum(axis=1)
+    unmeth_a = cov_a - meth_a
+    unmeth_b = cov_b - meth_b
+
+    pvalues, odds_ratios = glm_vectorized.fisher_exact_vectorized(
+        table_11=meth_a,
+        table_12=unmeth_a,
+        table_21=meth_b,
+        table_22=unmeth_b,
+    )
+    log_ors = np.log2(odds_ratios + 1e-10)
+    mean_diff, _, _ = _mean_diff_from_count_arrays(
+        meth_counts_a, cov_counts_a, meth_counts_b, cov_counts_b
+    )
+    return pvalues, log_ors, mean_diff
+
+
+def _glm_lrt_from_arrays(
+    meth_counts: np.ndarray,
+    cov_counts: np.ndarray,
+    design_full: np.ndarray,
+    design_reduced: np.ndarray,
+    *,
+    overdispersion: bool = True,
+) -> np.ndarray:
+    """Binomial GLM + LRT/Wald on count arrays shaped (n_sites, n_samples)."""
+    if not _HAS_STATSMODELS:
+        raise ImportError(
+            "statsmodels is required for GLM tests: pip install statsmodels"
+        )
+
+    meth = np.asarray(meth_counts, dtype=np.float64).T
+    cov = np.asarray(cov_counts, dtype=np.float64).T
+    y = np.stack([meth, cov - meth], axis=1)
+
+    cov_type = "HC0" if overdispersion else "nonrobust"
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit_full = glm_vectorized.glm_binomial_vectorized(
+            y, np.asarray(design_full, dtype=np.float64), cov_type=cov_type
+        )
+        fit_reduced = glm_vectorized.glm_binomial_vectorized(
+            y, np.asarray(design_reduced, dtype=np.float64), cov_type="nonrobust"
+        )
+
+    if overdispersion:
+        _, pvalues = glm_vectorized.wald_statistics_vectorized(
+            fit_full["coef"],
+            fit_full["se"],
+            contrast_idx=1,
+        )
+    else:
+        _, pvalues = glm_vectorized.lrt_statistics_vectorized(
+            fit_full["deviance"],
+            fit_reduced["deviance"],
+            df=1,
+        )
+
+    return pvalues
+
+
+def _limma_ebayes_from_arrays(
+    meth_counts: np.ndarray,
+    cov_counts: np.ndarray,
+    design_full: np.ndarray,
+    *,
+    chunk_size: int = 100000,
+    alpha: float = 0.5,
+) -> np.ndarray:
+    """Limma-style M-value test on count arrays shaped (n_sites, n_samples)."""
+    meth = np.asarray(meth_counts, dtype=np.float64).T
+    cov = np.asarray(cov_counts, dtype=np.float64).T
+    n_sites = meth.shape[1]
+    n_samples = meth.shape[0]
+
+    X_full = np.asarray(design_full, dtype=np.float64)
+    n_features = X_full.shape[1]
+
+    coef_treatment = np.full(n_sites, np.nan, dtype=np.float64)
+    var_resid = np.full(n_sites, np.nan, dtype=np.float64)
+    df_resid = np.full(n_sites, np.nan, dtype=np.float64)
+    unscaled_se_treat = np.full(n_sites, np.nan, dtype=np.float64)
+
+    for start in range(0, n_sites, chunk_size):
+        end = min(start + chunk_size, n_sites)
+        meth_chunk = meth[:, start:end]
+        cov_chunk = cov[:, start:end]
+
+        unmeth_chunk = cov_chunk - meth_chunk
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mvals = np.log2((meth_chunk + alpha) / (unmeth_chunk + alpha))
+
+        valid_mask = cov_chunk > 0
+        if np.all(valid_mask):
+            try:
+                coef, _, rank, _ = np.linalg.lstsq(X_full, mvals, rcond=None)
+            except np.linalg.LinAlgError:
+                continue
+            if rank < n_features:
+                continue
+
+            fitted = X_full @ coef
+            resid = mvals - fitted
+            df = n_samples - rank
+            if df <= 0:
+                continue
+
+            try:
+                xtx_inv = np.linalg.pinv(X_full.T @ X_full)
+                unscaled_se = float(np.sqrt(xtx_inv[1, 1]))
+            except np.linalg.LinAlgError:
+                continue
+
+            coef_treatment[start:end] = coef[1, :]
+            var_resid[start:end] = (resid**2).sum(axis=0) / df
+            df_resid[start:end] = float(df)
+            unscaled_se_treat[start:end] = unscaled_se
+        else:
+            mvals = np.where(valid_mask, mvals, np.nan)
+            for j in range(end - start):
+                y = mvals[:, j]
+                valid = np.isfinite(y)
+                if valid.sum() < n_features + 1:
+                    continue
+                X = X_full[valid, :]
+                y_valid = y[valid]
+
+                try:
+                    coef, _, rank, _ = np.linalg.lstsq(X, y_valid, rcond=None)
+                except np.linalg.LinAlgError:
+                    continue
+
+                if rank < n_features:
+                    continue
+
+                fitted = X @ coef
+                resid = y_valid - fitted
+                df = len(y_valid) - rank
+                if df <= 0:
+                    continue
+
+                try:
+                    xtx_inv = np.linalg.pinv(X.T @ X)
+                    unscaled_se = float(np.sqrt(xtx_inv[1, 1]))
+                except np.linalg.LinAlgError:
+                    continue
+
+                coef_treatment[start + j] = coef[1]
+                var_resid[start + j] = float((resid**2).sum() / df)
+                df_resid[start + j] = float(df)
+                unscaled_se_treat[start + j] = unscaled_se
+
+    valid_sites = (
+        np.isfinite(coef_treatment)
+        & np.isfinite(var_resid)
+        & np.isfinite(unscaled_se_treat)
+        & (df_resid > 0)
+    )
+    pvalues = np.ones(n_sites, dtype=np.float64)
+    if valid_sites.sum() == 0:
+        return pvalues
+
+    prior = _fit_ebayes_prior(var_resid[valid_sites], df_resid[valid_sites])
+    df_post = df_resid[valid_sites] + prior["df"]
+    var_post = (
+        (df_resid[valid_sites] * var_resid[valid_sites])
+        + (prior["df"] * prior["var"])
+    ) / df_post
+
+    t_stats = coef_treatment[valid_sites] / (
+        np.sqrt(var_post) * unscaled_se_treat[valid_sites]
+    )
+    pvals_valid = 2 * scipy_stats.t.sf(np.abs(t_stats), df=df_post)
+    pvalues[valid_sites] = pvals_valid
+    return pvalues
+
+
 # ---------------------------------------------------------------------------
 # Master entry point
 # ---------------------------------------------------------------------------

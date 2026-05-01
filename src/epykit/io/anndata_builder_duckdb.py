@@ -401,12 +401,13 @@ def build_anndata_streaming(
         # Collect one 1-row CSR per sample; vstack at the end.
         # Avoids lil_matrix's O(n) Python-loop element assignment which
         # balloons RSS by ~2 GB per sample on 42M-site outer joins.
-        _sparse_rows: list = []
+        _sparse_beta_rows: list = []
+        _sparse_cov_rows: list = []
+        _sparse_meth_rows: list = []
     else:
         beta_mat = np.full((n_samples, n_sites), fill_beta_na, dtype=np.float32)
-    
-    cov_mat  = np.zeros((n_samples, n_sites), dtype=np.int32)
-    meth_mat = np.zeros((n_samples, n_sites), dtype=np.int32)
+        cov_mat = np.zeros((n_samples, n_sites), dtype=np.int32)
+        meth_mat = np.zeros((n_samples, n_sites), dtype=np.int32)
     
     _log_duckdb_memory_state(con, f"[STEP 2] Arrays pre-allocated ({n_samples} × {n_sites})")
 
@@ -448,23 +449,45 @@ def build_anndata_streaming(
             from scipy.sparse import csr_matrix as _csr
             # Sort by column for valid CSR indptr construction
             order = np.argsort(locus_idx)
-            _sparse_rows.append(_csr(
-                (beta_vals[order],
-                 locus_idx[order],
-                 np.array([0, len(locus_idx)], dtype=np.int32)),
+            indptr = np.array([0, len(locus_idx)], dtype=np.int32)
+            _sparse_beta_rows.append(_csr(
+                (beta_vals[order], locus_idx[order], indptr),
                 shape=(1, n_sites),
                 dtype=np.float32,
             ))
+            _sparse_cov_rows.append(_csr(
+                (cov_vals[order], locus_idx[order], indptr),
+                shape=(1, n_sites),
+                dtype=np.int32,
+            ))
+            _sparse_meth_rows.append(_csr(
+                (meth_vals[order], locus_idx[order], indptr),
+                shape=(1, n_sites),
+                dtype=np.int32,
+            ))
         else:
             beta_mat[i, locus_idx] = beta_vals
-        
-        meth_mat[i, locus_idx] = meth_vals
-        cov_mat[i, locus_idx]  = cov_vals
+            meth_mat[i, locus_idx] = meth_vals
+            cov_mat[i, locus_idx] = cov_vals
 
         del result, locus_idx, beta_vals, meth_vals, cov_vals
         gc.collect()
         
         _log_duckdb_memory_state(con, f"[STEP 3.{i}] After JOIN completed and freed for {sid}")
+
+    # Assemble sparse matrices now so the per-sample CSR row lists can be freed
+    # before we fetch the genome-scale var table.
+    if sparse:
+        from scipy.sparse import vstack
+
+        X = vstack(_sparse_beta_rows, format="csr")
+        cov_layer = vstack(_sparse_cov_rows, format="csr")
+        meth_layer = vstack(_sparse_meth_rows, format="csr")
+
+        del _sparse_beta_rows, _sparse_cov_rows, _sparse_meth_rows
+        gc.collect()
+
+        _log_duckdb_memory_state(con, "[STEP 3] Sparse matrices assembled")
 
     # ------------------------------------------------------------------
     # Build var DataFrame from the locus index
@@ -475,8 +498,10 @@ def build_anndata_streaming(
     # integer *codes* from DuckDB and use pd.Categorical.from_codes().
     # Avoids 2+ GB of string overhead while achieving the same Categorical result.
     
-    # Step 4a: Build a chromosome code mapping in DuckDB (only ~25 unique values)
-    chr_mapping_result = con.execute("""
+    # Step 4a: Build a chromosome code mapping in DuckDB (computed once, not per-chunk)
+    # Create a persistent mapping table so chr codes can be JOINed efficiently
+    con.execute("""
+        CREATE TEMP TABLE _chr_codes AS
         SELECT DISTINCT chr, 
                DENSE_RANK() OVER (
                    ORDER BY CASE chr
@@ -498,65 +523,51 @@ def build_anndata_streaming(
                ) - 1 AS chr_code
         FROM _loci
         ORDER BY chr_code
-    """).fetchall()
+    """)
     
+    # Extract chromosome categories for Categorical.from_codes later
+    chr_mapping_result = con.execute("SELECT DISTINCT chr FROM _chr_codes ORDER BY chr_code").fetchall()
     chr_categories = [row[0] for row in chr_mapping_result]
     logger.debug(f"  Chromosome categories: {chr_categories}")
     
-    # Step 4b: Pre-allocate output arrays for chr codes and starts (no accumulation).
-    # This avoids peak-memory spike when np.concatenate holds both chunks and result.
-    logger.info("  [4/4b] Pre-allocating chr_codes and start arrays ...")
+    # Step 4b: Stream loci in chunks instead of materializing the full result
+    # set at once. This keeps the peak Python-side memory close to one chunk
+    # rather than the entire genome-scale locus table.
+    logger.info("  [4/4b] Streaming %d loci with chr codes in batches...", n_sites)
+    _log_duckdb_memory_state(con, "[STEP 4] Before streamed loci fetch")
+
     chr_codes_arr = np.empty(n_sites, dtype=np.int8)
     start_arr = np.empty(n_sites, dtype=np.int32)
-    
-    chunk_size = 2_000_000
+
+    loci_reader = con.execute("""
+        SELECT
+            c.chr_code,
+            l.start
+        FROM _loci l
+        JOIN _chr_codes c ON l.chr = c.chr
+        ORDER BY l.locus_idx
+    """).to_arrow_reader(batch_size=1_000_000)
+
     offset = 0
-    
-    while offset < n_sites:
-        chunk_limit = min(chunk_size, n_sites - offset)
-        loci_chunk = con.execute(f"""
-            SELECT
-                DENSE_RANK() OVER (
-                    ORDER BY CASE chr
-                        WHEN 'chr1'  THEN  1  WHEN 'chr2'  THEN  2
-                        WHEN 'chr3'  THEN  3  WHEN 'chr4'  THEN  4
-                        WHEN 'chr5'  THEN  5  WHEN 'chr6'  THEN  6
-                        WHEN 'chr7'  THEN  7  WHEN 'chr8'  THEN  8
-                        WHEN 'chr9'  THEN  9  WHEN 'chr10' THEN 10
-                        WHEN 'chr11' THEN 11  WHEN 'chr12' THEN 12
-                        WHEN 'chr13' THEN 13  WHEN 'chr14' THEN 14
-                        WHEN 'chr15' THEN 15  WHEN 'chr16' THEN 16
-                        WHEN 'chr17' THEN 17  WHEN 'chr18' THEN 18
-                        WHEN 'chr19' THEN 19  WHEN 'chr20' THEN 20
-                        WHEN 'chr21' THEN 21  WHEN 'chr22' THEN 22
-                        WHEN 'chrX'  THEN 23  WHEN 'chrY'  THEN 24
-                        WHEN 'chrM'  THEN 25  WHEN 'chrMT' THEN 25
-                        ELSE 99
-                    END
-                ) - 1 AS chr_code,
-                start
-            FROM _loci
-            ORDER BY locus_idx
-            LIMIT {chunk_limit} OFFSET {offset}
-        """).fetchnumpy()
-        
-        chunk_slice = slice(offset, offset + chunk_limit)
-        chr_codes_arr[chunk_slice] = loci_chunk["chr_code"].astype(np.int8)
-        start_arr[chunk_slice] = loci_chunk["start"].astype(np.int32)
-        
-        del loci_chunk
-        gc.collect()
-        
-        offset += chunk_limit
-        logger.debug(f"  Fetched {offset}/{n_sites} loci")
-        _log_duckdb_memory_state(con, f"[STEP 4.chunk] Fetched {offset}/{n_sites} loci chunk")
-    
-    _log_duckdb_memory_state(con, "[STEP 4] Before DuckDB connection closed")
+    for batch in loci_reader:
+        batch_len = batch.num_rows
+        chr_codes_arr[offset:offset + batch_len] = batch.column(0).to_numpy(zero_copy_only=False)
+        start_arr[offset:offset + batch_len] = batch.column(1).to_numpy(zero_copy_only=False)
+        offset += batch_len
+
+    if offset != n_sites:
+        raise RuntimeError(f"Expected {n_sites} loci, streamed {offset}")
+
+    logger.info("  [4/4b] Streamed all %d loci successfully", n_sites)
+
+    del loci_reader
+    gc.collect()
+    _log_duckdb_memory_state(con, "[STEP 4] After streaming loci")
     con.close()
     del con
     gc.collect()
-    
-    end_vals = (start_arr.astype(np.int64) + 1).astype(np.int32)
+
+    end_vals = start_arr + 1
     gc.collect()
     
     # Step 4d: Use from_codes to avoid materializing string values
@@ -591,28 +602,34 @@ def build_anndata_streaming(
     # ------------------------------------------------------------------
     # Assemble and return AnnData
     # ------------------------------------------------------------------
-    if sparse:
-        from scipy.sparse import vstack
-        X = vstack(_sparse_rows, format="csr")
-        del _sparse_rows
-        gc.collect()
-    else:
+    if not sparse:
         X = beta_mat
-    
+        cov_layer = cov_mat
+        meth_layer = meth_mat
+
+    # AnnData coerces var indices to strings during construction, which would
+    # materialize tens of millions of Python strings for genome-scale feature
+    # tables. Build the object without `var`, then attach the already-prepared
+    # var frame directly to avoid that conversion path.
     adata = ad.AnnData(
         X=X,
         obs=obs_df,
-        var=var_df,
         layers={
-            "coverage":          cov_mat,
-            "methylated_counts": meth_mat,
+            "coverage": cov_layer,
+            "methylated_counts": meth_layer,
         },
     )
+    adata._var = var_df
+    if n_sites <= 1_000_000:
+        adata._var.index = pd.Index(
+            var_df["locus_id"].astype(str),
+            name="locus_idx",
+        )
 
     if sparse:
-        del cov_mat, meth_mat, X
+        del cov_layer, meth_layer, X
     else:
-        del beta_mat, cov_mat, meth_mat, X
+        del beta_mat, cov_layer, meth_layer, X
     gc.collect()
 
     rss_after_adata = _get_rss_mb()

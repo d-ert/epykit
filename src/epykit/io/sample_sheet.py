@@ -5,6 +5,9 @@ Multi-sample loader: reads a CSV sample sheet, parallelises per-sample
 file ingestion using Polars native threading, outer-joins on genomic loci,
 and constructs a cohort-level AnnData object.
 
+This module also exposes a Parquet-native conversion entry point for the
+new storage model.
+
 Sample sheet format
 -------------------
 A CSV with at minimum these columns::
@@ -36,7 +39,7 @@ from __future__ import annotations
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Union
+from typing import TYPE_CHECKING, Union
 import shutil
 
 import pandas as pd
@@ -45,18 +48,17 @@ import polars as pl
 from epykit.io.anndata_builder import build_anndata
 from epykit.io.bismark import read_bismark_coverage, read_bismark_cx_report
 from epykit.io.generic import read_bedgraph, read_generic_methylation
+from epykit.io.parquet_converter import convert_sample_sheet
 from epykit.io.regions import load_and_merge_regions
 
 logger = logging.getLogger(__name__)
 
 PathLike = Union[str, Path]
 
-# AnnData is optional for type hints — import lazily
-try:
-    import anndata as ad
-    AnnData = ad.AnnData
-except ImportError:  # pragma: no cover
-    AnnData = None  # type: ignore
+if TYPE_CHECKING:  # pragma: no cover
+    from anndata import AnnData
+else:  # pragma: no cover
+    AnnData = object
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +154,62 @@ def _ensure_var_index_safe(adata: "AnnData") -> None:
             new_name,
         )
         adata.var.index = adata.var.index.set_names(new_name)
+
+
+def read_samples_to_parquet(
+    sample_sheet: PathLike,
+    output_dir: PathLike,
+    *,
+    n_workers: int | None = None,
+    min_coverage: int = 1,
+    max_coverage: int | None = None,
+    context: str | None = None,
+    fmt: str | None = None,
+    reader_kwargs: dict | None = None,
+    chunksize: int = 2_000_000,
+    compression: str = "zstd",
+) -> None:
+    """Convert a cohort sample sheet into the partitioned Parquet store.
+
+    Parameters
+    ----------
+    sample_sheet:
+        Path to the sample sheet CSV.
+    output_dir:
+        Root output directory for the Parquet store.
+    n_workers:
+        Number of worker processes used for per-sample conversion.
+    min_coverage, max_coverage, context, fmt:
+        Passed through to the underlying converters.
+    reader_kwargs:
+        Reserved for future format-specific conversion options.
+    chunksize:
+        Parquet row-group size used when writing each sample.
+    compression:
+        Parquet compression codec.
+    """
+    if reader_kwargs:
+        logger.debug(
+            "reader_kwargs was provided to read_samples_to_parquet but is not used yet: %s",
+            sorted(reader_kwargs.keys()),
+        )
+
+    sample_sheet = Path(sample_sheet)
+    if not sample_sheet.exists():
+        raise FileNotFoundError(f"Sample sheet not found: {sample_sheet}")
+
+    logger.info("Converting sample sheet %s to Parquet store %s", sample_sheet, output_dir)
+    convert_sample_sheet(
+        sample_sheet,
+        output_dir,
+        n_workers=n_workers,
+        min_coverage=min_coverage,
+        max_coverage=max_coverage,
+        context=context,
+        fmt=fmt or "auto",
+        chunksize=chunksize,
+        compression=compression,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +425,8 @@ def read_samples(
         # Conditionally re-read: skip by default to save RAM during peak I/O
         if validate_output:
             logger.info("Validating Zarr output by re-reading (validate_output=True)")
+            import anndata as ad
+
             adata = ad.read_zarr(str(out_path))
         else:
             logger.debug("Skipping Zarr re-read (validate_output=False)")

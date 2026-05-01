@@ -53,6 +53,27 @@ class TestMethylDataProperties:
         assert "group" in toy_mdata.samples.columns
 
 
+class TestMethylDataSparseAccessors:
+    """Sparse-safe accessor behavior."""
+
+    def test_sparse_layers_preserved(self, toy_adata):
+        """Sparse AnnData should keep sparse layers and accessors."""
+        from scipy.sparse import csr_matrix, issparse
+        from epykit.core import MethylData
+
+        adata = toy_adata.copy()
+        adata.X = csr_matrix(adata.X)
+        adata.layers["coverage"] = csr_matrix(adata.layers["coverage"])
+        adata.layers["methylated_counts"] = csr_matrix(adata.layers["methylated_counts"])
+
+        mdata = MethylData(adata)
+
+        assert issparse(mdata.beta)
+        assert issparse(mdata.coverage)
+        assert issparse(mdata.methylated)
+        assert isinstance(mdata.coverage_dense(), np.ndarray)
+
+
 class TestFilterCoverage:
     """Test filter_coverage method."""
 
