@@ -53,6 +53,35 @@ class TestFisherExactTest:
         # Sites 0-2 have ~30% vs ~70% methylation difference
         assert pvals[0] < 0.1 or pvals[1] < 0.1  # At least one should be significant
 
+    def test_fisher_sparse_matches_dense(self, toy_adata):
+        """fisher_exact_test on sparse MethylData should produce same p-values as dense."""
+        from scipy.sparse import csr_matrix
+        from epykit.core import MethylData
+        from epykit.stats.tests import fisher_exact_test
+
+        # Dense version
+        mdata_dense = MethylData(toy_adata.copy())
+
+        # Sparse version
+        adata_sparse = toy_adata.copy()
+        adata_sparse.X = csr_matrix(adata_sparse.X.astype(np.float32))
+        adata_sparse.layers["coverage"] = csr_matrix(
+            adata_sparse.layers["coverage"].astype(np.int32)
+        )
+        adata_sparse.layers["methylated_counts"] = csr_matrix(
+            adata_sparse.layers["methylated_counts"].astype(np.int32)
+        )
+        mdata_sparse = MethylData(adata_sparse)
+
+        idx_a = np.array([True, True, False, False])
+        idx_b = np.array([False, False, True, True])
+
+        pvals_dense, lors_dense, _ = fisher_exact_test(mdata_dense, idx_a=idx_a, idx_b=idx_b)
+        pvals_sparse, lors_sparse, _ = fisher_exact_test(mdata_sparse, idx_a=idx_a, idx_b=idx_b)
+
+        np.testing.assert_array_almost_equal(pvals_dense, pvals_sparse, decimal=10)
+        np.testing.assert_array_almost_equal(lors_dense, lors_sparse, decimal=10)
+
 
 class TestCalculateDiffMeth:
     """Integration tests for the master calculate_diff_meth() function."""

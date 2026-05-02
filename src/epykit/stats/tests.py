@@ -292,15 +292,24 @@ def fisher_exact_test(
     log2_odds_ratios : np.ndarray shape (n_sites,)
     mean_diff : np.ndarray shape (n_sites,) — mean_beta_B - mean_beta_A
     """
-    meth = mdata.methylated      # (n_samples, n_sites)
-    cov = mdata.coverage
-    unmeth = cov - meth
+    from scipy.sparse import issparse
 
-    # Sum across group samples (vectorized)
-    meth_a = meth[idx_a, :].sum(axis=0).astype(np.int64)
-    unmeth_a = unmeth[idx_a, :].sum(axis=0).astype(np.int64)
-    meth_b = meth[idx_b, :].sum(axis=0).astype(np.int64)
-    unmeth_b = unmeth[idx_b, :].sum(axis=0).astype(np.int64)
+    meth_layer = mdata.methylated_layer   # sparse or dense (n_samples, n_sites)
+    cov_layer = mdata.coverage_layer      # sparse or dense
+
+    if issparse(meth_layer):
+        meth_a = np.asarray(meth_layer[idx_a, :].sum(axis=0)).ravel().astype(np.int64)
+        meth_b = np.asarray(meth_layer[idx_b, :].sum(axis=0)).ravel().astype(np.int64)
+        cov_a = np.asarray(cov_layer[idx_a, :].sum(axis=0)).ravel().astype(np.int64)
+        cov_b = np.asarray(cov_layer[idx_b, :].sum(axis=0)).ravel().astype(np.int64)
+    else:
+        meth_a = np.asarray(meth_layer[idx_a, :]).sum(axis=0).astype(np.int64)
+        meth_b = np.asarray(meth_layer[idx_b, :]).sum(axis=0).astype(np.int64)
+        cov_a = np.asarray(cov_layer[idx_a, :]).sum(axis=0).astype(np.int64)
+        cov_b = np.asarray(cov_layer[idx_b, :]).sum(axis=0).astype(np.int64)
+
+    unmeth_a = cov_a - meth_a
+    unmeth_b = cov_b - meth_b
 
     # Vectorized Fisher test (batch computation)
     pvalues, odds_ratios = glm_vectorized.fisher_exact_vectorized(

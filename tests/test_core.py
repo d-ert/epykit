@@ -202,3 +202,130 @@ class TestMethylDataValidation:
 
         with pytest.raises(ValueError, match="missing required layers"):
             MethylData(bad_adata)
+
+
+# ---------------------------------------------------------------------------
+# Sparse MethylData tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def sparse_mdata(toy_adata):
+    """Return a MethylData backed by sparse layers."""
+    from scipy.sparse import csr_matrix
+    from epykit.core import MethylData
+    import anndata as ad
+
+    adata = toy_adata.copy()
+    # Convert all layers and X to sparse CSR
+    adata.X = csr_matrix(adata.X.astype(np.float32))
+    adata.layers["coverage"] = csr_matrix(adata.layers["coverage"].astype(np.int32))
+    adata.layers["methylated_counts"] = csr_matrix(
+        adata.layers["methylated_counts"].astype(np.int32)
+    )
+    return MethylData(adata)
+
+
+class TestSparseMethylData:
+    """Verify that MethylData works correctly when layers are stored sparse."""
+
+    def test_properties_return_sparse(self, sparse_mdata):
+        """beta, coverage, methylated should return sparse matrices when stored sparse."""
+        from scipy.sparse import issparse
+
+        assert issparse(sparse_mdata.beta), "beta should be sparse"
+        assert issparse(sparse_mdata.coverage), "coverage should be sparse"
+        assert issparse(sparse_mdata.methylated), "methylated should be sparse"
+
+    def test_unmethylated_sparse(self, sparse_mdata):
+        """unmethylated = coverage - methylated should work for sparse."""
+        from scipy.sparse import issparse
+
+        unm = sparse_mdata.unmethylated
+        assert issparse(unm), "unmethylated should be sparse"
+        assert unm.shape == (sparse_mdata.n_samples, sparse_mdata.n_sites)
+
+    def test_to_dense_converts_all_layers(self, sparse_mdata):
+        """to_dense() should return a MethylData with all dense numpy arrays."""
+        from scipy.sparse import issparse
+
+        dense = sparse_mdata.to_dense()
+        assert not issparse(dense.beta), "beta should be dense after to_dense()"
+        assert not issparse(dense.coverage), "coverage should be dense after to_dense()"
+        assert not issparse(dense.methylated), "methylated should be dense after to_dense()"
+
+    def test_to_dense_values_match(self, toy_mdata, sparse_mdata):
+        """to_dense() values should match the original dense MethylData."""
+        dense = sparse_mdata.to_dense()
+        np.testing.assert_array_almost_equal(dense.beta_dense, toy_mdata.beta_dense)
+        np.testing.assert_array_equal(
+            dense.coverage.astype(np.int32),
+            toy_mdata.coverage.astype(np.int32),
+        )
+
+    def test_filter_coverage_sparse(self, sparse_mdata):
+        """filter_coverage should work correctly on sparse MethylData."""
+        # All sites should pass with min_cov=0
+        filtered = sparse_mdata.filter_coverage(min_cov=0)
+        assert filtered.n_sites == sparse_mdata.n_sites
+
+        # Very high threshold should remove all sites
+        filtered_none = sparse_mdata.filter_coverage(min_cov=1000)
+        assert filtered_none.n_sites == 0
+
+    def test_filter_coverage_sparse_require_all(self, toy_adata):
+        """require_all_samples=True vs False differs for sparse MethylData."""
+        from scipy.sparse import csr_matrix
+        from epykit.core import MethylData
+
+        adata = toy_adata.copy()
+        # Make site 0: one sample with high coverage, others with low
+        cov = adata.layers["coverage"].copy()
+        cov[0, 0] = 50
+        cov[1:, 0] = 1
+        adata.layers["coverage"] = csr_matrix(cov.astype(np.int32))
+        adata.layers["methylated_counts"] = csr_matrix(
+            adata.layers["methylated_counts"].astype(np.int32)
+        )
+        adata.X = csr_matrix(adata.X.astype(np.float32))
+        mdata = MethylData(adata)
+
+        strict = mdata.filter_coverage(min_cov=10, require_all_samples=True)
+        lenient = mdata.filter_coverage(min_cov=10, require_all_samples=False)
+        assert strict.n_sites < lenient.n_sites
+
+    def test_unite_sparse(self, sparse_mdata):
+        """unite() should work on sparse MethylData."""
+        united = sparse_mdata.unite(type="intersect")
+        # All fixture sites have coverage > 0 in all samples
+        assert united.n_sites == sparse_mdata.n_sites
+
+    def test_unite_sparse_removes_uncovered(self, toy_adata):
+        """unite() should remove sites with 0 coverage in any sample (sparse)."""
+        from scipy.sparse import csr_matrix
+        from epykit.core import MethylData
+
+        adata = toy_adata.copy()
+        cov = adata.layers["coverage"].copy()
+        cov[0, 0] = 0   # zero out first sample at first site
+        adata.layers["coverage"] = csr_matrix(cov.astype(np.int32))
+        adata.layers["methylated_counts"] = csr_matrix(
+            adata.layers["methylated_counts"].astype(np.int32)
+        )
+        adata.X = csr_matrix(adata.X.astype(np.float32))
+        mdata = MethylData(adata)
+
+        united = mdata.unite(type="intersect")
+        assert united.n_sites == toy_adata.n_vars - 1
+
+    def test_coverage_stats_sparse(self, sparse_mdata):
+        """coverage_stats() should work for sparse MethylData."""
+        stats = sparse_mdata.coverage_stats()
+        assert set(stats.index) == set(sparse_mdata.obs_names)
+        assert "mean_cov" in stats.columns
+
+    def test_global_methylation_sparse(self, sparse_mdata):
+        """global_methylation() should work for sparse MethylData."""
+        gm = sparse_mdata.global_methylation()
+        assert "global_beta_mean" in gm.columns
+        valid = gm["global_beta_mean"].dropna()
+        assert (valid >= 0).all()

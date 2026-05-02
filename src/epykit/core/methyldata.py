@@ -27,7 +27,7 @@ Stored data
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Union
 
 import numpy as np
 import pandas as pd
@@ -39,8 +39,21 @@ try:
 except ImportError as e:  # pragma: no cover
     raise ImportError("anndata is required: pip install anndata") from e
 
+try:
+    import scipy.sparse as _sparse
+    _HAS_SCIPY = True
+except ImportError:  # pragma: no cover
+    _HAS_SCIPY = False
+
 if TYPE_CHECKING:
-    pass
+    import scipy.sparse
+
+
+def _to_dense_array(x) -> np.ndarray:
+    """Convert a sparse or dense matrix/array to a 2-D numpy ndarray."""
+    if hasattr(x, 'toarray'):
+        return x.toarray()
+    return np.asarray(x)
 
 
 # ---------------------------------------------------------------------------
@@ -89,29 +102,34 @@ class MethylData:
         return self._adata
 
     @property
-    def beta(self) -> np.ndarray:
+    def beta(self) -> "Union[np.ndarray, scipy.sparse.spmatrix]":
         """Beta-value matrix (methylation %).
 
         Shape: ``(n_samples, n_sites)`` — float32.
         Values range from 0 to 100.
-        NaN indicates a site with no coverage in that sample.
+        NaN (dense) or 0 (sparse) indicates a site with no coverage in that sample.
+
+        Returns the underlying sparse matrix when the AnnData X layer is stored
+        sparse. Call :meth:`to_dense` or use :meth:`beta_dense` for a dense array.
         """
-        X = self._adata.X
-        if hasattr(X, 'toarray'):  # Sparse matrix (CSR/CSC)
-            return X.toarray()
-        return np.asarray(X)
+        return self._adata.X
 
     @property
-    def coverage(self) -> np.ndarray:
+    def beta_dense(self) -> np.ndarray:
+        """Beta-value matrix as a dense numpy array (always densifies)."""
+        return _to_dense_array(self._adata.X)
+
+    @property
+    def coverage(self) -> "Union[np.ndarray, scipy.sparse.spmatrix]":
         """Total read coverage matrix.
 
         Shape: ``(n_samples, n_sites)`` — int32.
         Zero indicates no coverage.
+
+        Returns the underlying sparse matrix when the coverage layer is stored
+        sparse. Call :meth:`to_dense` for a fully dense MethylData.
         """
-        cov = self._adata.layers["coverage"]
-        if hasattr(cov, 'toarray'):  # Sparse matrix
-            return cov.toarray()
-        return np.asarray(cov)
+        return self._adata.layers["coverage"]
 
     @property
     def coverage_layer(self):
@@ -123,15 +141,14 @@ class MethylData:
         return self._adata.layers["coverage"]
 
     @property
-    def methylated(self) -> np.ndarray:
+    def methylated(self) -> "Union[np.ndarray, scipy.sparse.spmatrix]":
         """Methylated read count matrix.
 
         Shape: ``(n_samples, n_sites)`` — int32.
+
+        Returns the underlying sparse matrix when the layer is stored sparse.
         """
-        meth = self._adata.layers["methylated_counts"]
-        if hasattr(meth, 'toarray'):  # Sparse matrix
-            return meth.toarray()
-        return np.asarray(meth)
+        return self._adata.layers["methylated_counts"]
 
     @property
     def methylated_layer(self):
@@ -139,12 +156,13 @@ class MethylData:
         return self._adata.layers["methylated_counts"]
 
     @property
-    def unmethylated(self) -> np.ndarray:
+    def unmethylated(self) -> "Union[np.ndarray, scipy.sparse.spmatrix]":
         """Unmethylated read count matrix (coverage - methylated).
 
         Shape: ``(n_samples, n_sites)`` — int32.
+        Works for both sparse and dense storage.
         """
-        return self.coverage - self.methylated
+        return self._adata.layers["coverage"] - self._adata.layers["methylated_counts"]
 
     @property
     def sites(self) -> pd.DataFrame:
@@ -220,17 +238,35 @@ class MethylData:
         >>> mdata_filtered = mdata.filter_coverage(5, 500)
         >>> mdata_strict = mdata.filter_coverage(10, require_all_samples=True)
         """
-        cov = self.coverage  # (n_samples, n_sites)
+        from scipy.sparse import issparse
 
-        if require_all_samples:
-            # Keep sites where ALL samples meet min_cov
-            mask = np.all(cov >= min_cov, axis=0)
+        cov_layer = self._adata.layers["coverage"]
+        n_samples = self.n_samples
+
+        if issparse(cov_layer):
+            # Sparse-safe: compare stored values; implicit zeros fail min_cov > 0
+            if min_cov <= 0:
+                min_mask = np.ones(self.n_sites, dtype=bool)
+            else:
+                n_passing = np.asarray((cov_layer >= min_cov).sum(axis=0)).ravel()
+                if require_all_samples:
+                    min_mask = n_passing >= n_samples
+                else:
+                    min_mask = n_passing >= 1
+
+            if max_cov is not None:
+                n_exceeding = np.asarray((cov_layer > max_cov).sum(axis=0)).ravel()
+                mask = min_mask & (n_exceeding == 0)
+            else:
+                mask = min_mask
         else:
-            # Keep sites where ANY sample meets min_cov
-            mask = np.any(cov >= min_cov, axis=0)
-
-        if max_cov is not None:
-            mask = mask & np.all(cov <= max_cov, axis=0)
+            cov = np.asarray(cov_layer)
+            if require_all_samples:
+                mask = np.all(cov >= min_cov, axis=0)
+            else:
+                mask = np.any(cov >= min_cov, axis=0)
+            if max_cov is not None:
+                mask = mask & np.all(cov <= max_cov, axis=0)
 
         n_before = self.n_sites
         n_kept = int(mask.sum())
@@ -326,24 +362,34 @@ class MethylData:
         >>> united = mdata.unite(min_per_group=3,           # ≥3 per group
         ...                      treatment_col="group")
         """
+        from scipy.sparse import issparse
+
         if type == "union":
             logger.info("unite(type='union'): returning all %d sites", self.n_sites)
             return MethylData(self._adata.copy())
 
-        cov = self.coverage  # (n_samples, n_sites)
+        cov_layer = self._adata.layers["coverage"]
+        sparse = issparse(cov_layer)
 
         if treatment_col is not None and min_per_group is not None:
             # Per-group coverage mask
             groups = self._adata.obs[treatment_col].unique()
             mask = np.ones(self.n_sites, dtype=bool)
             for grp in groups:
-                grp_idx = self._adata.obs[treatment_col] == grp
-                grp_cov = cov[grp_idx.values, :]
-                n_covered = (grp_cov > 0).sum(axis=0)
+                grp_idx = (self._adata.obs[treatment_col] == grp).values
+                grp_cov = cov_layer[grp_idx, :]
+                if sparse:
+                    n_covered = np.asarray((grp_cov > 0).sum(axis=0)).ravel()
+                else:
+                    n_covered = (np.asarray(grp_cov) > 0).sum(axis=0)
                 mask &= n_covered >= min_per_group
         else:
             # All samples must have coverage > 0
-            mask = np.all(cov > 0, axis=0)
+            if sparse:
+                n_covered = np.asarray((cov_layer > 0).sum(axis=0)).ravel()
+                mask = n_covered >= self.n_samples
+            else:
+                mask = np.all(np.asarray(cov_layer) > 0, axis=0)
 
         n_before = self.n_sites
         n_kept = int(mask.sum())
@@ -360,6 +406,23 @@ class MethylData:
     # Convenience / info methods
     # ------------------------------------------------------------------
 
+    def to_dense(self) -> "MethylData":
+        """Return a new MethylData with all layers converted to dense numpy arrays.
+
+        Use this when you need dense arrays for downstream operations that do
+        not support sparse matrices (e.g., visualisation, export).
+
+        Returns
+        -------
+        MethylData
+            A copy with all sparse layers converted to dense.
+        """
+        adata = self._adata.copy()
+        adata.X = _to_dense_array(adata.X)
+        for key in list(adata.layers.keys()):
+            adata.layers[key] = _to_dense_array(adata.layers[key])
+        return MethylData(adata)
+
     def coverage_stats(self) -> pd.DataFrame:
         """Return per-sample coverage statistics.
 
@@ -370,16 +433,24 @@ class MethylData:
             ``pct_sites_covered``, ``n_sites_min1``.
             Index: sample IDs.
         """
-        cov = self.coverage
+        from scipy.sparse import issparse
+
+        cov_raw = self._adata.layers["coverage"]
+        sparse = issparse(cov_raw)
         total_sites = self.n_sites
         stats = []
         for i, sid in enumerate(self.obs_names):
-            row_cov = cov[i, :]
+            # Per-row densification is cheap (only one sample at a time)
+            if sparse:
+                row_cov = np.asarray(cov_raw[i, :].todense()).ravel()
+            else:
+                row_cov = np.asarray(cov_raw[i, :]).ravel()
             n_covered = int((row_cov > 0).sum())
+            covered_vals = row_cov[row_cov > 0]
             stats.append({
                 "sample_id": sid,
                 "mean_cov": float(np.nanmean(row_cov)),
-                "median_cov": float(np.median(row_cov[row_cov > 0])) if n_covered > 0 else 0.0,
+                "median_cov": float(np.median(covered_vals)) if n_covered > 0 else 0.0,
                 "n_sites": total_sites,
                 "n_sites_covered": n_covered,
                 "pct_sites_covered": 100.0 * n_covered / total_sites if total_sites > 0 else 0.0,
@@ -396,18 +467,36 @@ class MethylData:
             Columns: ``global_beta_mean``, ``global_beta_median``,
             ``total_methylated``, ``total_coverage``.
         """
-        meth = self.methylated
-        cov = self.coverage
+        from scipy.sparse import issparse
+
+        meth_raw = self._adata.layers["methylated_counts"]
+        cov_raw = self._adata.layers["coverage"]
+        beta_raw = self._adata.X
+        sparse_layers = issparse(meth_raw)
+        sparse_beta = issparse(beta_raw)
+
         records = []
         for i, sid in enumerate(self.obs_names):
-            total_m = int(meth[i, :].sum())
-            total_c = int(cov[i, :].sum())
-            row_beta = self.beta[i, :]
-            row_beta_covered = row_beta[~np.isnan(row_beta)]
+            # Per-row densification: only one sample loaded at a time
+            if sparse_layers:
+                meth_row = np.asarray(meth_raw[i, :].todense()).ravel()
+                cov_row = np.asarray(cov_raw[i, :].todense()).ravel()
+            else:
+                meth_row = np.asarray(meth_raw[i, :]).ravel()
+                cov_row = np.asarray(cov_raw[i, :]).ravel()
+
+            if sparse_beta:
+                beta_row = np.asarray(beta_raw[i, :].todense()).ravel()
+            else:
+                beta_row = np.asarray(beta_raw[i, :]).ravel()
+
+            total_m = int(meth_row.sum())
+            total_c = int(cov_row.sum())
+            beta_with_coverage = beta_row[~np.isnan(beta_row) & (cov_row > 0)]
             records.append({
                 "sample_id": sid,
-                "global_beta_mean": float(np.nanmean(row_beta_covered)) if len(row_beta_covered) else np.nan,
-                "global_beta_median": float(np.median(row_beta_covered)) if len(row_beta_covered) else np.nan,
+                "global_beta_mean": float(np.nanmean(beta_with_coverage)) if len(beta_with_coverage) else np.nan,
+                "global_beta_median": float(np.median(beta_with_coverage)) if len(beta_with_coverage) else np.nan,
                 "total_methylated": total_m,
                 "total_coverage": total_c,
                 "global_pct_meth": 100.0 * total_m / total_c if total_c > 0 else np.nan,

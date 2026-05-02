@@ -83,31 +83,38 @@ def fisher_exact_vectorized(
     col2 = table_12 + table_22  # b + d
     n_total = row1 + row2       # total count
 
-    # Hypergeometric p-values (one-sided, then double for two-sided)
+    # Hypergeometric p-values (two-tailed via minimum of both one-sided tails)
     # P(X=a) = C(a+c, a) * C(b+d, b) / C(n, a+b)
-    # But for speed, we use: log(C(n,k)) - computation
 
     # For each site, compute hypergeometric tail probabilities
+    col1 = table_11 + table_21  # a + c
+    row1 = table_11 + table_12  # a + b
+
     for i in range(n_sites):
-        a, b, c, d = table_11[i], table_12[i], table_21[i], table_22[i]
+        a = table_11[i]
         n = n_total[i]
 
         if n == 0:
             pvalues[i] = 1.0
             continue
 
-        # Use scipy's hypergeom to compute p-value
-        # hypergeom.sf(k-1, N, K, n) gives P(X >= k)
-        # Fish test is min(P(X = a), (1 - P(X = a-1)))
+        # Two-tailed Fisher: 2 * min(P(X <= a), P(X >= a))
+        # hypergeom.cdf(a, N, K, n) gives P(X <= a)
+        # hypergeom.sf(a-1, N, K, n) gives P(X >= a)
         try:
-            # One-tailed test: probability of observed or more extreme
-            pval_one = scipy_stats.hypergeom.sf(
-                a - 1,  # k-1, since sf is P(X > k) = P(X >= k+1)
-                n,      # Population size (total)
-                a + c,  # Number of success states (col1)
-                a + b,  # Number of draws (row1)
+            pval_upper = scipy_stats.hypergeom.sf(
+                a - 1,      # P(X >= a)
+                n,          # Population size (total)
+                col1[i],    # Number of success states (K)
+                row1[i],    # Number of draws
             )
-            pvalues[i] = min(2.0 * pval_one, 1.0)  # Two-tailed
+            pval_lower = scipy_stats.hypergeom.cdf(
+                a,          # P(X <= a)
+                n,          # Population size (total)
+                col1[i],    # Number of success states (K)
+                row1[i],    # Number of draws
+            )
+            pvalues[i] = min(2.0 * min(pval_upper, pval_lower), 1.0)
         except Exception:
             pvalues[i] = 1.0
 
