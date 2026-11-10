@@ -1,0 +1,151 @@
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  # No branch filter on pull_request: stacked PRs whose base is another
+  # feature branch must run CI too. Pushes stay filtered to main.
+  pull_request:
+
+env:
+  # Pinned uv release. Bump deliberately, together with Dockerfile.python,
+  # and re-run `uv lock` so the lockfile is written by the same version CI
+  # checks it with.
+  UV_VERSION: "0.12.10"
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # PRs run three legs (ubuntu 3.10 and 3.13, windows 3.12); pushes to main run all six.
+      # One Windows leg is enough on a PR: Windows failures here have been platform-level, not per-Python-version.
+      matrix:
+        include: >-
+          ${{ fromJSON(github.event_name == 'pull_request'
+          && '[{"os": "ubuntu-latest", "python-version": "3.10"},
+          {"os": "ubuntu-latest", "python-version": "3.13"},
+          {"os": "windows-latest", "python-version": "3.12"}]'
+          || '[{"os": "ubuntu-latest", "python-version": "3.10"},
+          {"os": "ubuntu-latest", "python-version": "3.12"},
+          {"os": "ubuntu-latest", "python-version": "3.13"},
+          {"os": "windows-latest", "python-version": "3.10"},
+          {"os": "windows-latest", "python-version": "3.12"},
+          {"os": "windows-latest", "python-version": "3.13"}]') }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          # uv.lock is committed (reproducibility), so key the cache off it.
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install epykit + test deps
+        run: uv sync --locked --python ${{ matrix.python-version }} --group dev --extra all
+
+      - name: Run pytest (skip slow, with coverage)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: uv run --python ${{ matrix.python-version }} pytest -m "not slow" --strict-markers -ra --cov=epykit --cov-report=term-missing
+
+  slow:
+    name: pytest slow tier (ubuntu, py3.12)
+    # The accuracy / calibration / chain-merge logic lives behind the `slow`
+    # marker and is excluded from the matrix `test` job. Run it here on both
+    # push AND pull_request (M9) so the statistical guarantees (incl.
+    # real-engine null calibration) are exercised BEFORE merge, not only after.
+    # It's a single ubuntu/py3.12 job, so the per-PR cost stays bounded; the
+    # fast engine-oracle tests (tests/test_engine_oracles.py) additionally run
+    # in the matrix `test` job incl. a Windows leg on every PR.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install epykit + test deps
+        run: uv sync --locked --python 3.12 --group dev --extra all
+
+      - name: Run pytest (slow tier)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: uv run --python 3.12 pytest -m slow --strict-markers -ra
+
+  lint:
+    name: ruff + mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Lockfile is in sync with pyproject.toml
+        # `--locked` on the sync steps only proves the lock is *usable*; this
+        # proves it also matches pyproject.toml, so a dependency edit that
+        # forgot `uv lock` fails here instead of silently re-resolving.
+        run: uv lock --check
+
+      - name: Install epykit + dev tools
+        run: uv sync --locked --python 3.12 --group dev --extra all
+
+      - name: Ruff
+        run: uv run --python 3.12 ruff check src/ tests/
+
+      - name: Mypy
+        run: uv run --python 3.12 mypy src/epykit
+
+  build:
+    # Build the sdist + wheel, validate the package metadata, and smoke-test
+    # the installed wheel in a clean environment so a broken sdist, missing
+    # package-data, or bad metadata is caught before it reaches PyPI (M-pkg4).
+    name: build + wheel smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Build sdist + wheel
+        run: uv run --python 3.12 --with build python -m build
+
+      - name: Validate package metadata
+        run: uv run --python 3.12 --with twine twine check dist/*
+
+      - name: Install the built wheel in a clean env and smoke-test the CLI
+        run: |
+          uv venv --python 3.12 /tmp/wheelcheck
+          uv pip install --python /tmp/wheelcheck/bin/python dist/*.whl
+          /tmp/wheelcheck/bin/epykit --help
+          /tmp/wheelcheck/bin/python -c "import epykit; print('epykit', epykit.__version__)"
