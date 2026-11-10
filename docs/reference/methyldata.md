@@ -1,0 +1,166 @@
+# MethylData API
+
+`MethylData` is the central data container in epykit. It is a lightweight
+dataclass that holds sample metadata, a reference to the on-disk methylstore,
+and all analysis results. Every `ep.pp.*`, `ep.tl.*`, and `ep.pl.*` function
+takes a `MethylData` object and modifies it in place.
+
+## Slots
+
+| Slot | Type | Description |
+|------|------|-------------|
+| `obs` | `pl.DataFrame` | Per-sample metadata. One row per sample. Columns include `sample_id`, `group`, and any samplesheet covariates. QC metrics are added here by `ep.tl.qc()`. |
+| `store` | `str` | Filesystem path to the partitioned Parquet methylstore. Updated by preprocessing steps as the active cache stage changes. |
+| `varm` | `dict[str, pl.DataFrame]` | Per-variable (per-CpG) result tables, keyed by name. DMC results are stored here (e.g., `"dmc_lr"`, `"dmc_glm"`, `"dmc_lr_annotated"`). |
+| `uns` | `dict[str, Any]` | Unstructured storage for analysis results that are not per-sample or per-CpG. DMR results, DVC results, annotation metadata, and other outputs are stored here. |
+| `analysis_root` | `str` / `Path` / None | Optional root directory used by `tl.dmc(resumable=True)` and related sinks to anchor cache + CSV output. Public attribute since 1.0; the underscore-prefixed `_analysis_root` is a deprecated alias and will be removed in 2.0. |
+
+## Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `dmc` | `pl.DataFrame` | Shortcut to the most recent DMC result in `varm`. Equivalent to `md.varm["dmc_<test>"]` for the last test that was run. |
+| `treatment_ids` | `list[str]` | Sample IDs in the treatment group. |
+| `control_ids` | `list[str]` | Sample IDs in the control group. |
+| `n_samples` | `int` | Total number of samples (treatment + control). |
+| `state` | `str` | Current preprocessing state (e.g., `"united"`, `"filtered"`). |
+| `completed_stages` | `list[str]` | Ordered list of completed pipeline stages (e.g., `["ingest", "filter", "normalize", "unite"]`). |
+
+## Methods
+
+### save
+
+```python
+md.save(path: str)
+```
+
+Save the full analysis state to a directory. Writes `obs.parquet`, per-varm
+parquet files, serialized `uns` data, and a `methyldata.json` metadata file.
+The methylstore itself is not copied -- the saved metadata references the
+original store path.
+
+### get_dmc
+
+```python
+md.get_dmc(test: str | None = None) -> pl.DataFrame
+```
+
+Retrieve a DMC result by test name. If `test` is None, returns the most recent
+DMC result (same as the `dmc` property). If `test` is specified, returns
+`md.varm["dmc_<test>"]`.
+
+```python
+# Get the most recent DMC result
+dmc = md.get_dmc()
+
+# Get a specific test's result
+dmc_glm = md.get_dmc(test="glm")
+```
+
+### region_beta
+
+```python
+md.region_beta(chrom: str, start: int, end: int) -> pl.DataFrame
+```
+
+Query per-sample methylation beta values within a genomic region. Returns a
+DataFrame with columns `sample_id`, `pos`, and `beta` for all CpGs in the
+specified region across all samples.
+
+```python
+region = md.region_beta("chr1", 1_000_000, 1_010_000)
+print(region.head())
+```
+
+### report
+
+```python
+md.report(output: str)
+```
+
+Generate a self-contained interactive HTML report. The report includes summary
+statistics, QC metrics, top DMC/DMR tables, and embedded plots.
+
+```python
+md.report("results/report.html")
+```
+
+### export_tables
+
+```python
+md.export_tables(
+    out_dir: str,
+    *,
+    alpha: float = 0.05,
+    full: bool = False,
+    fmt: Literal["tsv", "csv"] = "tsv",
+    dmc: bool = True, dmr: bool = True, dvc: bool = True, qc: bool = True,
+) -> dict[str, str]
+```
+
+Write every result table present on the object (DMC, DMR, DVC, and the
+per-sample QC summary) to `out_dir` in one call. Missing tables are skipped
+(nothing is raised). Returns a dict mapping logical table name → path written.
+See [Tabular Exports](../export/tables.md) for the file names and options.
+
+```python
+md.export_tables("results/tables")             # significant tables, .tsv
+md.export_tables("results/tables", full=True)  # + full DMC / DVC tables
+```
+
+## Result Storage Conventions
+
+Each analysis step stores its output in a specific slot:
+
+| Analysis | Storage Location | Example Access |
+|----------|-----------------|----------------|
+| DMC results | Parquet store / property | `md.dmc` or `md.get_dmc()` |
+| Significant DMCs | Filtered DataFrame | `md.significant_dmcs()` |
+| Export tables | TSV/CSV files | `md.export_tables()` |
+| Genome tracks | BED / bedGraph / BigWig | `md.dmcs_to_bed()`, `md.to_bedgraph()` |
+| HTML report | Self-contained HTML | `md.report()` |
+
+Annotation (`ep.tl.annotate()`) adds `gene_feature` and `cpg_context` columns
+directly to the DMC DataFrame and stores the annotated version as
+`md.varm["dmc_<test>_annotated"]`. The original un-annotated DMC result is
+preserved.
+
+## Creating a MethylData Object
+
+You do not construct `MethylData` directly. It is returned by the reader
+functions:
+
+```python
+import epykit as ep
+
+# From Bismark
+md = ep.read_bismark("samples.csv", treatment_group="tumor",
+                     control_group="normal", assembly="hg38")
+
+# From MethylDackel
+md = ep.read_methyldackel("samples.csv", treatment_group="tumor",
+                          control_group="normal", assembly="hg38")
+
+# From nf-core/methylseq
+md = ep.read_nfcore_methylseq(run_dir="results/", treatment_group="tumor",
+                              control_group="normal",
+                              treatment_samples=["t1"], control_samples=["c1"],
+                              assembly="hg38")
+
+# Load a saved analysis
+md = ep.load("results/my_analysis")
+```
+
+## Printing
+
+Printing a `MethylData` object displays a summary of its contents:
+
+```python
+print(md)
+# MethylData object
+#   Samples: 6 (3 treatment, 3 control)
+#   Store: methylstore/ (united)
+#   Stages: ingest -> filter -> normalize -> unite
+#   varm keys: dmc_lr, dmc_lr_annotated
+#   uns keys: dmr, annotation_gtf
+```
