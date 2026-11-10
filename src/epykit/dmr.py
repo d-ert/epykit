@@ -1,0 +1,2791 @@
+"""Differentially Methylated Region (DMR) calling.
+
+Two algorithms:
+
+``call_dmr_tile_based(methylstore_path, samples_treatment, samples_control,
+...)``
+    Tile aggregation: sums (N_meth, coverage) across CpGs per sample
+    within each fixed-size tile, then runs a full DMC test on the
+    tile-level counts. Recommended path -- read-pooled tile tests have
+    dramatically more power than per-CpG p-value combination at typical
+    WGBS coverage.
+
+``call_dmr_sliding_window(dmc_results, ...)``
+    Operates on a precomputed per-CpG DMC table; combines p-values per
+    window via signed Stouffer's Z. Faster but lower-power; sign comes
+    from each CpG's meth_diff so mixed-direction windows are downweighted.
+    Direction (hyper / hypo / mixed) is set by the sign of the mean
+    meth_diff rather than a raw site tally.
+
+``smooth_methylation_gaussian`` is a coverage-weighted Gaussian-kernel
+smoother -- see its own docstring.
+"""
+
+from __future__ import annotations
+
+import gc
+import logging
+import math
+import tempfile
+import warnings
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, Literal
+
+import numpy as np
+import polars as pl
+from numba import njit
+from scipy import stats as sp_stats
+
+from . import _cache
+from ._chroms import filter_canonical_logged
+from ._dmc_store import DMCStore
+
+logger = logging.getLogger(__name__)
+
+
+def _dmr_sliding_cache_key(
+    store: DMCStore,
+    window_bp: int,
+    min_cpgs: int,
+    min_sites_significant: int,
+    alpha: float,
+    min_abs_meth_diff: float,
+    p_col: str,
+) -> str:
+    """SHA-256 fingerprint of DMR-sliding inputs that affect the result.
+
+    Combines the DMC store's input signature with the DMR parameters so
+    a rerun with identical arguments reads from cache. ``step_bp`` is
+    deliberately omitted -- the new two-pointer sweep ignores it.
+    """
+    base_sig = store.manifest.get("input_sig", "")
+    return _cache.fingerprint(
+        [
+            ("base", base_sig),
+            ("method", "spatial-stouffer-v1"),
+            ("win", str(int(window_bp))),
+            ("mincp", str(int(min_cpgs))),
+            ("minsig", str(int(min_sites_significant))),
+            ("alpha", f"{float(alpha):.10g}"),
+            ("delta", f"{float(min_abs_meth_diff):.10g}"),
+            ("pcol", p_col),
+        ]
+    )
+
+
+def _dmr_chain_merge_cache_key(
+    store: DMCStore,
+    alpha: float,
+    min_abs_meth_diff: float,
+    dis_merge_bp: int,
+    min_cpgs: int,
+    pct_sig: float,
+    minlen_bp: int,
+    p_col: str,
+) -> str:
+    """SHA-256 fingerprint of chain-merge DMR inputs (DSS callDMR semantics).
+
+    Mirrors :func:`_dmr_sliding_cache_key` for the chain-merge caller.
+    """
+    base_sig = store.manifest.get("input_sig", "")
+    return _cache.fingerprint(
+        [
+            ("base", base_sig),
+            ("region_correction", "complete-interval-family-by-spatial-stouffer-v3"),
+            ("alpha", f"{float(alpha):.10g}"),
+            ("delta", f"{float(min_abs_meth_diff):.10g}"),
+            ("dismerge", str(int(dis_merge_bp))),
+            ("mincp", str(int(min_cpgs))),
+            ("pctsig", f"{float(pct_sig):.10g}"),
+            ("minlen", str(int(minlen_bp))),
+            ("pcol", p_col),
+        ]
+    )
+
+
+_DMR_EMPTY_SCHEMA = {
+    "chrom": pl.Utf8,
+    "start": pl.Int32,
+    "end": pl.Int32,
+    "n_cpgs": pl.Int32,
+    "n_significant": pl.Int32,
+    "mean_meth_diff": pl.Float32,
+    "combined_pvalue": pl.Float64,
+    "combined_qvalue": pl.Float64,
+    "dmr_type": pl.Utf8,
+}
+
+_DMR_TILE_SCHEMA = {
+    "chrom": pl.Utf8,
+    "start": pl.Int32,
+    "end": pl.Int32,
+    "n_cpgs": pl.Int32,
+    "n_case": pl.Int32,
+    "n_control": pl.Int32,
+    "mean_beta_case": pl.Float32,
+    "mean_beta_control": pl.Float32,
+    "meth_diff": pl.Float32,
+    "log2_odds_ratio": pl.Float64,
+    "pvalue": pl.Float64,
+    "qvalue": pl.Float64,
+    "dmr_type": pl.Utf8,
+}
+
+_SMOOTH_EMPTY_SCHEMA = {
+    "chrom": pl.Utf8,
+    "pos": pl.Int32,
+    "sample": pl.Utf8,
+    "beta_raw": pl.Float32,
+    "beta_smooth": pl.Float32,
+}
+
+# cap merged DMR size to prevent biologically implausible mega-DMRs.
+# Mammalian DMRs are typically 200 bp - 5 kb; 10 kb is a generous ceiling.
+_MAX_DMR_BP: int = 10_000
+
+# a window's direction is called "mixed" when the fraction of
+# valid sites agreeing with the sign of the mean is below this threshold.
+_MIXED_DIRECTION_THRESHOLD: float = 0.6
+
+
+# Internal helpers -- DMC input streaming for sliding-window DMR
+
+
+def _dmc_store_columns(store: DMCStore) -> set[str]:
+    """Return the column set present in the store's per-chrom parquets.
+
+    Reads the schema of the first chromosome's parquet. All chroms are
+    assumed to share the same schema (enforced by
+    ``process_chromosomes_dmc``).
+    """
+    chroms = store.chroms()
+    if not chroms:
+        return set()
+    schema = pl.read_parquet_schema(str(store.path / f"chrom={chroms[0]}.parquet"))
+    return set(schema.keys())
+
+
+def _iter_dmc_store_chroms(
+    store: DMCStore,
+    p_col: str,
+) -> Iterator[tuple[str, pl.DataFrame]]:
+    """Yield ``(chrom, sorted per-chrom DataFrame)`` from a ``DMCStore``.
+
+    Only the columns the sliding-window sweep needs are read; this keeps
+    per-chrom IO at ~50 MB even on chr1 (1.8M CpGs).
+    """
+    cols = ["chrom", "pos", "meth_diff", "pvalue"]
+    if p_col == "qvalue":
+        cols.append("qvalue")
+    for chrom in store.chroms():
+        df = store.read_chrom(chrom, columns=cols)
+        if len(df) == 0:
+            yield chrom, df
+            continue
+        yield chrom, df.sort("pos")
+
+
+def _iter_dataframe_chroms(
+    df: pl.DataFrame,
+    p_col: str,
+) -> Iterator[tuple[str, pl.DataFrame]]:
+    """Yield per-chrom slices of an in-memory DMC DataFrame in sorted order."""
+    for chrom in sorted(df["chrom"].unique().to_list()):
+        yield chrom, df.filter(pl.col("chrom") == chrom).sort("pos")
+
+
+# Internal helpers -- p-value combination
+
+
+@njit(cache=True, nogil=True)
+def _estimate_chrom_z_length_scale(positions: np.ndarray, z_signed: np.ndarray) -> float:
+    """Estimate spatial autocorrelation length scale lambda (bp) of signed Z-scores.
+
+    Uses robust trimmed correlation of adjacent CpG pairs within [1, 100] bp
+    to capture background spatial correlation without signal-outlier bias.
+    """
+    n = len(positions)
+    if n < 200:
+        return 100.0
+    sum_xy = 0.0
+    sum_x2 = 0.0
+    sum_y2 = 0.0
+    sum_d = 0.0
+    count = 0
+    for i in range(n - 1):
+        d = positions[i + 1] - positions[i]
+        if 0 < d <= 100:
+            x = z_signed[i]
+            y = z_signed[i + 1]
+            # Clip at |z| <= 2.5 so true DMRs don't inflate background correlation
+            if abs(x) <= 2.5 and abs(y) <= 2.5:
+                sum_xy += x * y
+                sum_x2 += x * x
+                sum_y2 += y * y
+                sum_d += d
+                count += 1
+    if count < 50 or sum_x2 <= 0.0 or sum_y2 <= 0.0:
+        return 100.0
+    rho1 = sum_xy / np.sqrt(sum_x2 * sum_y2)
+    if rho1 <= 0.02:
+        return 1.0  # Essentially independent
+    rho1 = min(rho1, 0.85)
+    mean_d = sum_d / count
+    return max(mean_d / (-np.log(rho1)), 10.0)
+
+
+@njit(cache=True, nogil=True)
+def _spatial_variance_sum(pos_valid: np.ndarray, w: np.ndarray, length_scale: float) -> float:
+    """Compute w^T Sigma w where Sigma_ij = exp(-|pos_i - pos_j| / length_scale)."""
+    k = len(pos_valid)
+    var_sum = 0.0
+    inv_lam = 1.0 / length_scale if length_scale > 0.0 else 0.0
+    for i in range(k):
+        wi = w[i]
+        var_sum += wi * wi
+        if inv_lam > 0.0:
+            pi = pos_valid[i]
+            for j in range(i + 1, k):
+                corr = np.exp(-(pos_valid[j] - pi) * inv_lam)
+                if corr < 1e-4:
+                    break  # Positions are sorted; further CpGs have negligible correlation
+                var_sum += 2.0 * wi * w[j] * corr
+    return var_sum
+
+
+def _stouffer_combine_signed(
+    pvals: np.ndarray,
+    meth_diffs: np.ndarray,
+    weights: np.ndarray | None = None,
+    positions: np.ndarray | None = None,
+    length_scale: float = 120.0,
+) -> float:
+    """Combine per-CpG two-sided p-values via spatial-correlation-adjusted signed Stouffer's Z."""
+    pvals = np.asarray(pvals, dtype=np.float64)
+    meth_diffs = np.asarray(meth_diffs, dtype=np.float64)
+
+    valid = ~np.isnan(pvals) & (pvals > 0.0) & (pvals <= 1.0) & ~np.isnan(meth_diffs)
+    if not np.any(valid):
+        return float("nan")
+
+    p_valid = np.clip(pvals[valid], np.finfo(float).tiny, 1.0 - 1e-15)
+    diff_valid = meth_diffs[valid]
+
+    z_mag = sp_stats.norm.isf(p_valid / 2.0)
+    z_signed = np.sign(diff_valid) * z_mag
+
+    if weights is None:
+        w = np.ones_like(z_signed)
+    else:
+        w = np.asarray(weights, dtype=np.float64)[valid]
+        w = np.where(np.isfinite(w) & (w >= 0), w, 0.0)
+
+    if positions is not None and length_scale > 1.0 and len(z_signed) > 1:
+        pos_valid = np.asarray(positions, dtype=np.float64)[valid]
+        var_sum = _spatial_variance_sum(pos_valid, w, float(length_scale))
+    else:
+        var_sum = float(np.sum(w * w))
+
+    if var_sum <= 0.0:
+        return float("nan")
+
+    z_combined = float(np.sum(w * z_signed) / np.sqrt(var_sum))
+    return float(2.0 * sp_stats.norm.sf(abs(z_combined)))
+
+
+def _merge_intervals(starts: list[int], ends: list[int]) -> list[tuple[int, int]]:
+    """Merge overlapping (start, end) integer intervals."""
+    if not starts:
+        return []
+    pairs = sorted(zip(starts, ends, strict=False), key=lambda x: x[0])
+    merged: list[tuple[int, int]] = [pairs[0]]
+    for s, e in pairs[1:]:
+        if s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _classify_direction(
+    mean_diff: float,
+    n_hyper: int,
+    n_hypo: int,
+) -> str:
+    """Classify DMR direction from mean effect + per-site sign tally.
+
+    previously the direction was the larger of n_hyper / n_hypo.
+    A window with 6 hyper sites at +0.12 and 4 hypo sites at -0.40 was
+    called "hyper" even though the mean effect was clearly negative.
+
+    The new rule:
+      - Mean direction governs (sign of mean_meth_diff). This matches
+        what the tile-based path does when it pools reads.
+      - If the per-site sign tally is too close (< 60 % majority), the
+        window is labelled "mixed" so downstream filters can drop it.
+    """
+    total_signed = n_hyper + n_hypo
+    if total_signed == 0:
+        return "mixed"
+    consensus = max(n_hyper, n_hypo) / total_signed
+    if consensus < _MIXED_DIRECTION_THRESHOLD:
+        return "mixed"
+    if np.isnan(mean_diff):
+        # Fall back to majority tally if mean is undefined for some reason.
+        return "hyper" if n_hyper > n_hypo else "hypo"
+    return "hyper" if mean_diff > 0 else "hypo"
+
+
+def _recompute_dmr_stats(
+    chrom: str,
+    start: int,
+    end: int,
+    positions: np.ndarray,
+    meth_diffs: np.ndarray,
+    pvals: np.ndarray,
+    is_sig: np.ndarray,
+    min_cpgs: int,
+    min_sites_significant: int,
+    # Optional pre-computed prefix arrays for O(log n) slice
+    cum_sig: np.ndarray | None = None,
+    length_scale: float = 120.0,
+) -> dict | None:
+    """Recompute accurate per-site statistics over a merged interval.
+
+    When ``cum_sig`` is supplied the significance count is computed in O(1)
+    via prefix-sum lookup; otherwise falls back to a boolean mask scan.
+    """
+    # reject biologically implausible mega-DMRs that arise when
+    # overlapping candidate windows collapse across many megabases.
+    if (end - start) > _MAX_DMR_BP:
+        return None
+
+    # Use searchsorted for O(log n) slice instead of boolean mask
+    lo = int(np.searchsorted(positions, start, side="left"))
+    hi = int(np.searchsorted(positions, end, side="left"))
+
+    n_cpgs = hi - lo
+    if n_cpgs < min_cpgs:
+        return None
+
+    if cum_sig is not None:
+        n_sig = int(cum_sig[hi] - cum_sig[lo])
+    else:
+        n_sig = int(is_sig[lo:hi].sum())
+
+    if n_sig < min_sites_significant:
+        return None
+
+    window_diffs = meth_diffs[lo:hi]
+    window_pvals = pvals[lo:hi]
+    window_pos = positions[lo:hi]
+
+    valid_diffs = window_diffs[~np.isnan(window_diffs)]
+    if len(valid_diffs) == 0:
+        return None
+
+    n_hyper = int((valid_diffs > 0).sum())
+    n_hypo = int((valid_diffs < 0).sum())
+
+    # signed Stouffer's Z. Sign comes from per-CpG meth_diff so the
+    # combined statistic naturally cancels mixed-direction windows.
+    combined_p = _stouffer_combine_signed(
+        window_pvals,
+        window_diffs,
+        positions=window_pos,
+        length_scale=length_scale,
+    )
+    if np.isnan(combined_p):
+        return None
+
+    mean_diff = float(np.nanmean(window_diffs))
+    dmr_type = _classify_direction(mean_diff, n_hyper, n_hypo)
+
+    return {
+        "chrom": chrom,
+        "start": start,
+        "end": end,
+        "n_cpgs": n_cpgs,
+        "n_significant": n_sig,
+        "mean_meth_diff": float(np.float32(mean_diff)),
+        "combined_pvalue": float(combined_p),
+        "dmr_type": dmr_type,
+    }
+
+
+# Public API -- sliding-window DMR calling (works from a DMC table)
+
+
+def call_dmr_sliding_window(
+    dmc_results: pl.DataFrame | DMCStore | str | Path,
+    window_bp: int = 500,
+    step_bp: int = 250,
+    min_cpgs: int = 5,
+    min_sites_significant: int = 3,
+    alpha: float = 0.05,
+    min_abs_meth_diff: float = 0.1,
+) -> pl.DataFrame:
+    """Call DMRs by aggregating DMC sites into overlapping sliding windows.
+
+    This method takes a precomputed DMC table and combines per-CpG p-values
+    region-by-region with signed Stouffer's Z. It is fast and reuses an
+    existing DMC call, but has lower power than the tile-based path
+    (`call_dmr_tile_based`) because it cannot pool reads -- windows whose
+    individual CpGs aren't significant won't gather enough sig sites to
+    pass the `min_sites_significant` gate.
+
+    Memory scaling
+    --------------
+    The implementation uses a two-pointer CpG-anchored sweep -- each
+    chromosome's peak memory scales with the number of CpGs on that
+    chromosome (a few hundred MB for full human autosomes), independent
+    of genomic span. The earlier bp-grid enumeration would have
+    materialised one window position every ``step_bp`` across the whole
+    chromosome (5M positions on chr1 alone) and OOM'd on full-genome
+    inputs. ``step_bp`` is still accepted for backward compatibility
+    but is effectively a no-op in the new implementation: every CpG
+    anchors a candidate and the downstream merge collapses redundancy.
+
+    Parameters
+    ----------
+    dmc_results : pl.DataFrame | DMCStore | str | Path
+        DMC results to process. Accepts:
+
+        * ``pl.DataFrame`` -- in-memory table (legacy path); held in
+          memory for the whole DMR pass.
+        * ``DMCStore`` -- handle to a persistent per-chrom parquet
+          directory (returned by
+          ``process_chromosomes_dmc(..., return_store=True)``).
+          Chromosomes are streamed from disk; peak memory is
+          O(largest chromosome).
+        * ``str`` / ``Path`` -- path to a populated DMC store
+          directory; opened via :meth:`DMCStore.open`.
+
+        Required columns: chrom, pos, meth_diff, pvalue.
+        Optional: qvalue (used in preference to pvalue when present).
+    window_bp : int
+        Window width in base pairs.
+    step_bp : int
+        Accepted but no longer meaningful (see "Memory scaling" above).
+        Kept in the signature so old call sites don't break.
+    min_cpgs : int
+        Minimum CpG count in a *merged* DMR.
+    min_sites_significant : int
+        Minimum significant CpG sites in a window for it to be a candidate.
+    alpha : float
+        Significance threshold for qvalue / pvalue.
+    min_abs_meth_diff : float
+        Minimum |meth_diff| for a site to count as significant.
+
+    Returns
+    -------
+    pl.DataFrame
+        Columns: chrom, start, end, n_cpgs, n_significant,
+                 mean_meth_diff, combined_pvalue, combined_qvalue,
+                 dmr_type ("hyper" | "hypo" | "mixed").
+        ``combined_qvalue`` is BH-corrected genome-wide across DMR
+        candidates that passed the per-window gate.
+    """
+    if isinstance(dmc_results, (str, Path)):
+        dmc_results = DMCStore.open(dmc_results)
+
+    if step_bp > window_bp:
+        raise ValueError(f"step_bp ({step_bp}) must be <= window_bp ({window_bp})")
+
+    # DMR cache: when the input is a DMCStore with a known input_sig,
+    # the entire sliding-window output is a pure function of that sig
+    # plus the DMR params. Stash the result inside the DMC store dir.
+    dmr_cache_path: Path | None = None
+    if isinstance(dmc_results, DMCStore) and dmc_results.manifest.get("input_sig"):
+        available_cols = _dmc_store_columns(dmc_results)
+        p_col_for_key = "qvalue" if "qvalue" in available_cols else "pvalue"
+        key = _dmr_sliding_cache_key(
+            dmc_results,
+            window_bp,
+            min_cpgs,
+            min_sites_significant,
+            alpha,
+            min_abs_meth_diff,
+            p_col_for_key,
+        )
+        dmr_cache_path = dmc_results.path / f".dmr_sliding_{key[:16]}.parquet"
+        if dmr_cache_path.exists():
+            cached = pl.read_parquet(str(dmr_cache_path))
+            logger.info(
+                "DMR sliding-window cache hit at %s (%d DMR(s)); skipping recompute.",
+                dmr_cache_path.name,
+                len(cached),
+            )
+            return cached
+
+    if isinstance(dmc_results, DMCStore):
+        available_cols = _dmc_store_columns(dmc_results)
+        required = {"chrom", "pos", "meth_diff", "pvalue"}
+        missing = required - available_cols
+        if missing:
+            raise ValueError(f"DMC results missing required columns: {missing}")
+        p_col = "qvalue" if "qvalue" in available_cols else "pvalue"
+        chrom_iter = _iter_dmc_store_chroms(dmc_results, p_col)
+    else:
+        required = {"chrom", "pos", "meth_diff", "pvalue"}
+        missing = required - set(dmc_results.columns)
+        if missing:
+            raise ValueError(f"DMC results missing required columns: {missing}")
+        p_col = "qvalue" if "qvalue" in dmc_results.columns else "pvalue"
+        chrom_iter = _iter_dataframe_chroms(dmc_results, p_col)
+
+    logger.info(
+        "call_dmr_sliding_window: window=%d bp, step=%d bp, "
+        "min_cpgs=%d, min_sig=%d, alpha=%.3f, min_|Deltabeta|=%.2f, p_col=%s",
+        window_bp,
+        step_bp,
+        min_cpgs,
+        min_sites_significant,
+        alpha,
+        min_abs_meth_diff,
+        p_col,
+    )
+
+    all_records: list[dict] = []
+
+    for chrom, chrom_df in chrom_iter:
+        if len(chrom_df) == 0:
+            continue
+
+        positions = chrom_df["pos"].to_numpy()
+        meth_diffs = chrom_df["meth_diff"].to_numpy(allow_copy=True).astype(np.float32)
+        # The significance gate uses the FDR-controlled column (qvalue if
+        # present); the Stouffer combine MUST use the raw per-CpG p-values,
+        # which are ~U(0,1) under the null. q-values are not uniform, so
+        # combining them does not yield a valid p-value (M-DMR1). chain-merge
+        # already keeps these two roles separate; sliding-window now matches.
+        sig_vals = chrom_df[p_col].to_numpy(allow_copy=True).astype(np.float64)
+        raw_pvals = chrom_df["pvalue"].to_numpy(allow_copy=True).astype(np.float64)
+
+        is_sig = (
+            (~np.isnan(sig_vals))
+            & (sig_vals < alpha)
+            & (~np.isnan(meth_diffs))
+            & (np.abs(meth_diffs) >= min_abs_meth_diff)
+        )
+
+        # ---------------------------------------------------------------
+        # Two-pointer CpG-anchored sweep.
+        #
+        # Replaces the prior bp-grid enumeration (np.arange over the whole
+        # chromosome with step_bp) which scaled with genome span and
+        # OOM'd on full-genome 22M-CpG input (chr1 alone produced 5M
+        # window positions). The new pass is O(n_CpGs) per chrom and
+        # bounded in memory by the size of the per-chrom arrays.
+        #
+        # For each CpG i, the candidate window is
+        # ``[positions[i], positions[i] + window_bp)``; we maintain a
+        # running right pointer j and a rolling significant-CpG count.
+        # ``step_bp`` is accepted for backward compatibility but is no
+        # longer meaningful -- every CpG anchors a candidate, and the
+        # downstream merge collapses redundancy without any change in
+        # the final DMR set.
+        # ---------------------------------------------------------------
+        is_sig_int = is_sig.astype(np.int8, copy=False)
+        n_pos = len(positions)
+        cand_starts: list[int] = []
+        cand_ends: list[int] = []
+
+        j = 0
+        n_sig_running = 0
+        for i in range(n_pos):
+            limit = positions[i] + window_bp
+            # advance j until positions[j] no longer fits in [pos_i, pos_i+window_bp)
+            while j < n_pos and positions[j] < limit:
+                n_sig_running += int(is_sig_int[j])
+                j += 1
+            # window [i, j) -- all CpGs in [positions[i], positions[i]+window_bp)
+            n_cpgs_win = j - i
+            if n_cpgs_win >= min_cpgs and n_sig_running >= min_sites_significant:
+                cand_starts.append(int(positions[i]))
+                cand_ends.append(int(positions[i]) + window_bp)
+            # drop CpG i from the rolling count before advancing i
+            n_sig_running -= int(is_sig_int[i])
+
+        if not cand_starts:
+            logger.info("  %s: no candidate windows", chrom)
+            del chrom_df, positions, meth_diffs, sig_vals, raw_pvals, is_sig, is_sig_int
+            gc.collect()
+            continue
+
+        merged_spans = _merge_intervals(cand_starts, cand_ends)
+        chrom_dmrs = 0
+
+        # _recompute_dmr_stats can still use a prefix-sum array for O(1)
+        # range counts in the final pass -- that's per-merged-span (a
+        # small number) so it doesn't break the O(n_CpGs) budget.
+        cum_sig = np.empty(n_pos + 1, dtype=np.int32)
+        cum_sig[0] = 0
+        np.cumsum(is_sig_int.astype(np.int32, copy=False), out=cum_sig[1:])
+
+        # Estimate chromosome-specific spatial Z correlation length scale
+        valid_z_mask = np.isfinite(raw_pvals) & (raw_pvals > 0) & (raw_pvals <= 1) & np.isfinite(meth_diffs)
+        if np.sum(valid_z_mask) >= 200:
+            p_clipped = np.clip(raw_pvals[valid_z_mask], 1e-300, 1.0 - 1e-15)
+            z_chr = np.sign(meth_diffs[valid_z_mask]) * sp_stats.norm.isf(p_clipped / 2.0)
+            chrom_lambda = _estimate_chrom_z_length_scale(positions[valid_z_mask], z_chr)
+        else:
+            chrom_lambda = 120.0
+
+        for start, end in merged_spans:
+            rec = _recompute_dmr_stats(
+                chrom,
+                start,
+                end,
+                positions,
+                meth_diffs,
+                raw_pvals,
+                is_sig,
+                min_cpgs,
+                min_sites_significant,
+                cum_sig=cum_sig,
+                length_scale=chrom_lambda,
+            )
+            if rec is not None:
+                all_records.append(rec)
+                chrom_dmrs += 1
+
+        logger.info(
+            "  %s: %d candidate span(s) -> %d DMR(s)",
+            chrom,
+            len(merged_spans),
+            chrom_dmrs,
+        )
+        # Free per-chrom buffers before next iteration. Critical when
+        # streaming from a DMCStore on a 22M-site genome: without this
+        # the buffer-pool references can pile up and defeat the
+        # whole-table-streaming win.
+        del chrom_df, positions, meth_diffs, sig_vals, raw_pvals, is_sig, is_sig_int, cum_sig
+        gc.collect()
+
+    if not all_records:
+        logger.warning("No DMRs found with current filters")
+        empty = pl.DataFrame(schema=_DMR_EMPTY_SCHEMA)
+        if dmr_cache_path is not None:
+            empty.write_parquet(str(dmr_cache_path))
+        return empty
+
+    dmr_df = (
+        pl.DataFrame(all_records)
+        .with_columns(
+            [
+                pl.col("start").cast(pl.Int32),
+                pl.col("end").cast(pl.Int32),
+                pl.col("n_cpgs").cast(pl.Int32),
+                pl.col("n_significant").cast(pl.Int32),
+                pl.col("mean_meth_diff").cast(pl.Float32),
+            ]
+        )
+        .sort(["chrom", "start"])
+    )
+
+    # BH-correct DMR-level combined p-values so downstream filters
+    # are operating on q-values. Without this the sliding-window output
+    # was effectively un-corrected at the region level.
+    from .dmc import apply_multiple_testing_correction
+
+    dmr_df = apply_multiple_testing_correction(
+        dmr_df,
+        method="fdr_bh",
+        pvalue_col="combined_pvalue",
+        qvalue_col="combined_qvalue",
+    )
+    if dmr_cache_path is not None:
+        dmr_df.write_parquet(str(dmr_cache_path))
+        logger.info(
+            "DMR sliding-window result cached at %s",
+            dmr_cache_path.name,
+        )
+    return dmr_df
+
+
+# Public API -- chain-and-merge DMR calling (DSS-callDMR-*style*; see the
+# "Differences from DSS callDMR" note in call_dmr_chain_merge)
+
+DMR_PRESETS: dict[str, dict] = {
+    # "strict": very confident DMRs only. Use when downstream uses cannot
+    # tolerate false positives (e.g. follow-up validation experiments).
+    # Higher alpha bar, larger effect-size floor, more CpGs required.
+    "strict": dict(
+        alpha=1e-6,
+        min_abs_meth_diff=0.20,
+        dis_merge_bp=250,
+        min_cpgs=5,
+        pct_sig=0.5,
+        minlen_bp=100,
+    ),
+    # "default": conservative seed gate for exploratory WGBS analyses.
+    # The 10% per-CpG effect-size floor is kept (matches DSS delta=0.1) so
+    # individual measurement noise can't anchor chains. Recommended starting point;
+    # use 'strict' for validation-ready DMRs or 'permissive' for exploratory analyses.
+    "default": dict(
+        alpha=1e-4,
+        min_abs_meth_diff=0.10,
+        dis_merge_bp=500,
+        min_cpgs=3,
+        pct_sig=0.5,
+        minlen_bp=50,
+    ),
+    # "permissive": recall-oriented. Loosens alpha and the gap rule, drops
+    # the effect-size floor halfway. Useful for exploratory analyses, gene-
+    # set enrichment, or comparisons where false negatives are costlier
+    # than false positives. Expect noticeably lower PPV.
+    "permissive": dict(
+        alpha=1e-4,
+        min_abs_meth_diff=0.05,
+        dis_merge_bp=1000,
+        min_cpgs=3,
+        pct_sig=0.5,
+        minlen_bp=50,
+    ),
+}
+
+
+_DMR_DEFAULT_MIN_CPGS = 5
+"""Default min CpGs/DMR for the CLI and tl.dmr layers (matches the
+benchmark paper's chain_merge default). NOTE: this intentionally differs
+from call_dmr_chain_merge's own bare default of 3 (the DSS engine default
+for direct engine callers). The high-level layers default to 5; direct
+engine callers default to 3. Do not 'reconcile' these without re-running
+the chain_merge benchmark -- the paper's numbers depend on the 5."""
+
+
+def resolve_layer_min_cpgs(min_cpgs: int | None, preset: str | None) -> int:
+    """Resolve the effective min_cpgs for the CLI / tl.dmr layer.
+
+    Precedence: an explicit ``min_cpgs`` wins; else a preset's bundled
+    ``min_cpgs``; else ``_DMR_DEFAULT_MIN_CPGS`` (5). Validates ``preset``
+    with the same message ``call_dmr_chain_merge`` uses, so an invalid
+    preset raises a friendly ValueError rather than a bare KeyError.
+    """
+    if min_cpgs is not None:
+        return min_cpgs
+    if preset is not None:
+        if preset not in DMR_PRESETS:
+            raise ValueError(f"Unknown preset {preset!r}. Choose from {list(DMR_PRESETS)}.")
+        return DMR_PRESETS[preset]["min_cpgs"]
+    return _DMR_DEFAULT_MIN_CPGS
+
+
+def apply_region_qfilter(
+    dmr_df: pl.DataFrame,
+    min_mean_qvalue: float | None,
+    *,
+    candidate_cols: tuple[str, ...] = ("combined_qvalue", "combined_pvalue"),
+) -> pl.DataFrame:
+    """Drop DMRs whose region-level q-value (or p-value fallback) is not
+    below ``min_mean_qvalue``.
+
+    Shared by ``tl.dmr`` and the ``epykit dmr`` CLI so the chain_merge /
+    sliding_window / tile post-filters stay byte-identical across the API
+    and CLI (the whole point of the parity batch). ``segment`` deliberately
+    does NOT call this -- it has no region-level q post-filter.
+
+    The first column in ``candidate_cols`` that is present in ``dmr_df`` is
+    used; if none are present, or ``min_mean_qvalue is None``, or the frame
+    is empty, the frame is returned unchanged.
+
+    - chain_merge / sliding_window use the default
+      ``("combined_qvalue", "combined_pvalue")`` (adjusted combined
+      value: complete-interval-family BY for chain_merge, selected-window BH
+      for sliding_window; falling back to the raw combined p-value).
+    - tile uses ``("qvalue",)`` (its own per-tile BH q-value); the
+      "first present candidate else unchanged" rule reproduces the prior
+      ``"qvalue" in dmr_df.columns`` guard exactly.
+    """
+    if min_mean_qvalue is None or len(dmr_df) == 0:
+        return dmr_df
+    for col in candidate_cols:
+        if col in dmr_df.columns:
+            return dmr_df.filter(pl.col(col) < min_mean_qvalue)
+    return dmr_df
+
+
+def call_dmr_chain_merge(
+    dmc_results: pl.DataFrame | DMCStore | str | Path,
+    *,
+    preset: str | None = None,
+    alpha: float = 0.05,
+    min_abs_meth_diff: float = 0.1,
+    dis_merge_bp: int = 500,
+    min_cpgs: int | None = None,
+    pct_sig: float = 0.5,
+    minlen_bp: int = 50,
+    use_q_for_sig: bool = False,
+) -> pl.DataFrame:
+    """Call DMRs by chaining contiguous significant CpGs and merging gaps.
+
+    Implements a DSS ``callDMR``-*style* chain-and-merge on top of an epykit
+    DMC table (see "Differences from DSS callDMR" below -- this is a related
+    construction, not a faithful reimplementation):
+
+      1. Mark significant CpGs:
+         ``(pvalue < alpha) AND (|meth_diff| >= min_abs_meth_diff)``.
+         When ``use_q_for_sig=True`` and a ``qvalue`` column is present,
+         the q-value drives the significance gate instead.
+      2. Walk sorted positions per chromosome. A new sig CpG joins the
+         current chain when its distance to the *previous significant*
+         CpG is <= ``dis_merge_bp``; otherwise it starts a new chain.
+      3. A chain's span is ``[first_sig_pos, last_sig_pos + 1)``.
+      4. Apply filters: span length >= ``minlen_bp``; total CpGs in span
+         (sig + non-sig) >= ``min_cpgs``; fraction significant >=
+         ``pct_sig``.
+      5. Combine the per-CpG p-values in the surviving span via signed
+         Stouffer's Z (reused from ``call_dmr_sliding_window``); classify
+         direction (``hyper`` / ``hypo`` / ``mixed``) from the mean
+         ``meth_diff`` and per-site sign tally.
+      6. BY-correct against every geometry-admissible contiguous interval
+         genome-wide, assigning p=1 to unreported intervals. The family is
+         defined from positions, count, length and gap limits before selecting
+         significant CpGs. This accounts for the interval search and overlap
+         dependence; validity still requires calibrated fixed-interval raw
+         p-values, which signed Stouffer does not guarantee for correlated CpGs.
+
+    Differences from DSS callDMR (do not treat the two as interchangeable)
+    ----------------------------------------------------------------------
+    * **No smoothing / dispersion shrinkage.** DSS smooths the mean
+      methylation and shrinks the per-CpG dispersion before computing its
+      test statistic; this caller consumes raw, unsmoothed epykit per-CpG
+      p-values. Boundaries and which CpGs pass therefore differ from DSS.
+    * **Non-DSS region statistic.** DSS summarises regions by length / area
+      of the smoothed statistic; the ``combined_pvalue`` here is an epykit
+      spatial autocorrelation-adjusted signed-Stouffer construct (see
+      :func:`_stouffer_combine_signed`).
+    * **Default gate.** The ``"default"`` preset uses ``alpha=1e-4``
+      and ``min_cpgs=3``; these settings do not establish FDR calibration.
+
+    Geometrically this is more permissive than ``call_dmr_sliding_window``
+    for sparse-cluster signal: two sig CpGs 140 bp apart cannot fit in a
+    100 bp anchored window, but they chain in DSS at ``dis_merge_bp=100``
+    because their gap is <= 100 bp from one sig CpG to the next.
+
+    Tuning guidance
+    ---------------
+    If recall is too low for your use case, **loosen ``dis_merge_bp``
+    first** (e.g. 500 -> 1000). It's the single highest-leverage knob:
+    CpG-poor intergenic and intronic regions need wider gap-merging just
+    to recover real DMRs whose CpGs are spread out. Loosening
+    ``dis_merge_bp`` typically gains 5-10 pp of recall for only ~6 pp of
+    PPV cost -- a genuine Pareto improvement, unlike loosening ``alpha``
+    (which crashes PPV by 15-20 pp for only 2-4 pp of recall on most
+    datasets we've benchmarked).
+
+    The ``pct_sig`` knob is **effectively dead at strict ``alpha``** (e.g.
+    1e-5 to 1e-4): the few CpGs that pass cluster tightly enough that
+    >50% of any candidate's CpGs are already significant, so the 0.5
+    threshold never bites. Don't bother tuning it unless you've also
+    loosened ``alpha`` substantially.
+
+    For common scenarios prefer the ``preset=`` bundles instead of
+    hand-tuning: ``"strict"`` (validation-ready DMRs), ``"default"``
+    (balanced, recommended starting point -- looser than DSS callDMR, see
+    above), ``"permissive"`` (exploratory / recall-oriented).
+
+    Parameters
+    ----------
+    dmc_results
+        DMC results -- same input contract as
+        :func:`call_dmr_sliding_window` (DataFrame, DMCStore, or path).
+    preset : {"strict", "default", "permissive"}, optional
+        Apply a named parameter bundle from :data:`DMR_PRESETS`. Any
+        explicit kwarg passed alongside ``preset`` overrides the bundled
+        value (so you can pick a preset and tweak one knob).
+    alpha
+        Significance threshold for ``pvalue`` (or ``qvalue`` when
+        ``use_q_for_sig=True``).
+    min_abs_meth_diff
+        Minimum ``|meth_diff|`` for a CpG to count as significant.
+        Default ``0.1`` matches the convention in the methylation
+        literature (DSS, methylKit, BSmooth all report DMRs with at
+        least 10% methylation difference).
+    dis_merge_bp
+        Maximum distance (in bp) between consecutive significant CpGs
+        for them to belong to the same chain. DSS default: 100. See the
+        tuning guidance above -- this is the first knob to loosen if
+        recall is too low.
+    min_cpgs
+        Minimum total CpGs (sig + non-sig) inside a chain's span. Uses a
+        ``None`` sentinel: when ``None`` (the default) the value is taken
+        from the active ``preset`` if one is given, otherwise it falls
+        back to ``3`` (the DSS engine default). Pass an explicit integer
+        to override any preset.
+    pct_sig
+        Minimum fraction of CpGs in the span that must be significant.
+        DSS default: 0.5. Note: this knob is effectively dead at strict
+        ``alpha`` values.
+    minlen_bp
+        Minimum span length in base pairs. DSS default: 50.
+    use_q_for_sig
+        If True and ``qvalue`` is present, use it for the significance
+        gate.
+
+    Returns
+    -------
+    pl.DataFrame
+        Same schema as :func:`call_dmr_sliding_window`:
+        ``chrom, start, end, n_cpgs, n_significant, mean_meth_diff,
+        combined_pvalue, combined_qvalue, dmr_type``.
+    """
+    # Resolve preset bundle. Caller-provided kwargs override bundled values
+    # by tracking which params arrived at their default values vs explicit.
+    # Most params re-bind from the preset only if they match the signature
+    # defaults (signaling "user didn't set this"). ``min_cpgs`` is special:
+    # its tl.dmr/CLI default of 5 collides with this ==default sentinel
+    # scheme, so it uses an explicit ``None`` sentinel instead (None ->
+    # preset value if a preset is active, else 3; any int overrides).
+    if preset is not None:
+        if preset not in DMR_PRESETS:
+            raise ValueError(f"Unknown preset {preset!r}. Choose from {list(DMR_PRESETS)}.")
+        bundle = DMR_PRESETS[preset]
+        # Default sentinels match the signature defaults above.
+        _SIG_DEFAULTS = dict(
+            alpha=0.05,
+            min_abs_meth_diff=0.1,
+            dis_merge_bp=500,
+            pct_sig=0.5,
+            minlen_bp=50,
+        )
+        if alpha == _SIG_DEFAULTS["alpha"]:
+            alpha = bundle["alpha"]
+        if min_abs_meth_diff == _SIG_DEFAULTS["min_abs_meth_diff"]:
+            min_abs_meth_diff = bundle["min_abs_meth_diff"]
+        if dis_merge_bp == _SIG_DEFAULTS["dis_merge_bp"]:
+            dis_merge_bp = bundle["dis_merge_bp"]
+        if min_cpgs is None:
+            min_cpgs = bundle["min_cpgs"]
+        if pct_sig == _SIG_DEFAULTS["pct_sig"]:
+            pct_sig = bundle["pct_sig"]
+        if minlen_bp == _SIG_DEFAULTS["minlen_bp"]:
+            minlen_bp = bundle["minlen_bp"]
+    # No preset (or preset bundle lacked min_cpgs): fall back to the DSS
+    # engine default. After this point min_cpgs is always a concrete int,
+    # so the cache key and the per-chain filter see a resolved value.
+    if min_cpgs is None:
+        min_cpgs = 3
+    if isinstance(dmc_results, (str, Path)):
+        dmc_results = DMCStore.open(dmc_results)
+
+    # Cache lookup (mirror of the sliding-window cache).
+    dmr_cache_path: Path | None = None
+    if isinstance(dmc_results, DMCStore) and dmc_results.manifest.get("input_sig"):
+        available_cols = _dmc_store_columns(dmc_results)
+        sig_col = "qvalue" if (use_q_for_sig and "qvalue" in available_cols) else "pvalue"
+        key = _dmr_chain_merge_cache_key(
+            dmc_results,
+            alpha=alpha,
+            min_abs_meth_diff=min_abs_meth_diff,
+            dis_merge_bp=dis_merge_bp,
+            min_cpgs=min_cpgs,
+            pct_sig=pct_sig,
+            minlen_bp=minlen_bp,
+            p_col=sig_col,
+        )
+        dmr_cache_path = dmc_results.path / f".dmr_chain_merge_{key[:16]}.parquet"
+        if dmr_cache_path.exists():
+            cached = pl.read_parquet(str(dmr_cache_path))
+            logger.info(
+                "DMR chain-merge cache hit at %s (%d DMR(s)); skipping recompute.",
+                dmr_cache_path.name,
+                len(cached),
+            )
+            return cached
+
+    if isinstance(dmc_results, DMCStore):
+        available_cols = _dmc_store_columns(dmc_results)
+        required = {"chrom", "pos", "meth_diff", "pvalue"}
+        missing = required - available_cols
+        if missing:
+            raise ValueError(f"DMC results missing required columns: {missing}")
+        sig_col = "qvalue" if (use_q_for_sig and "qvalue" in available_cols) else "pvalue"
+        chrom_iter = _iter_dmc_store_chroms(dmc_results, sig_col)
+    else:
+        required = {"chrom", "pos", "meth_diff", "pvalue"}
+        missing = required - set(dmc_results.columns)
+        if missing:
+            raise ValueError(f"DMC results missing required columns: {missing}")
+        sig_col = "qvalue" if (use_q_for_sig and "qvalue" in dmc_results.columns) else "pvalue"
+        chrom_iter = _iter_dataframe_chroms(dmc_results, sig_col)
+
+    logger.info(
+        "call_dmr_chain_merge: alpha=%.3g, min_|Deltabeta|=%.2f, dis_merge=%d bp, "
+        "min_cpgs=%d, pct_sig=%.2f, minlen=%d bp, sig_col=%s",
+        alpha,
+        min_abs_meth_diff,
+        dis_merge_bp,
+        min_cpgs,
+        pct_sig,
+        minlen_bp,
+        sig_col,
+    )
+
+    all_records: list[dict] = []
+    family_size = 0
+    from ._region_search import adjust_selected, count_intervals
+
+    for chrom, chrom_df in chrom_iter:
+        if len(chrom_df) == 0:
+            continue
+
+        positions = chrom_df["pos"].to_numpy()
+        family_size += count_intervals(positions, min_cpgs, minlen_bp, dis_merge_bp)
+        meth_diffs = chrom_df["meth_diff"].to_numpy(allow_copy=True).astype(np.float32)
+        # pvals is always the raw pvalue column (used by Stouffer's Z).
+        pvals = chrom_df["pvalue"].to_numpy(allow_copy=True).astype(np.float64)
+        # sig_vals is what we threshold against alpha -- either pvalue or qvalue.
+        sig_vals = chrom_df[sig_col].to_numpy(allow_copy=True).astype(np.float64)
+
+        is_sig = (
+            (~np.isnan(sig_vals))
+            & (sig_vals < alpha)
+            & (~np.isnan(meth_diffs))
+            & (np.abs(meth_diffs) >= min_abs_meth_diff)
+        )
+        sig_idx = np.flatnonzero(is_sig)
+        if sig_idx.size == 0:
+            del chrom_df, positions, meth_diffs, pvals, sig_vals, is_sig, sig_idx
+            gc.collect()
+            continue
+
+        # Chain consecutive sig CpGs whose pairwise gap <= dis_merge_bp.
+        # The chain is a list of (first_sig_idx, last_sig_idx) pairs.
+        sig_pos = positions[sig_idx]
+        gaps = np.diff(sig_pos)
+        # Boundary indices: positions where a new chain begins (gap > dis_merge_bp).
+        break_after = np.flatnonzero(gaps > dis_merge_bp)
+        # Convert to chain boundaries over the sig_idx array.
+        chain_lo = np.concatenate([[0], break_after + 1])
+        chain_hi = np.concatenate([break_after, [sig_idx.size - 1]])
+
+        # Estimate chromosome-specific spatial Z correlation length scale
+        valid_z_mask = np.isfinite(pvals) & (pvals > 0) & (pvals <= 1) & np.isfinite(meth_diffs)
+        if np.sum(valid_z_mask) >= 200:
+            p_clipped = np.clip(pvals[valid_z_mask], 1e-300, 1.0 - 1e-15)
+            z_chr = np.sign(meth_diffs[valid_z_mask]) * sp_stats.norm.isf(p_clipped / 2.0)
+            chrom_lambda = _estimate_chrom_z_length_scale(positions[valid_z_mask], z_chr)
+        else:
+            chrom_lambda = 120.0
+
+        # Prefix-sum on is_sig for O(1) significant-count lookups.
+        is_sig_int = is_sig.astype(np.int32, copy=False)
+        cum_sig = np.empty(positions.size + 1, dtype=np.int32)
+        cum_sig[0] = 0
+        np.cumsum(is_sig_int, out=cum_sig[1:])
+
+        chrom_dmrs = 0
+        for lo, hi in zip(chain_lo, chain_hi, strict=True):
+            i_first = int(sig_idx[lo])
+            i_last = int(sig_idx[hi])
+            start_pos = int(positions[i_first])
+            # End is exclusive in epykit's schema; +1 to include i_last.
+            end_pos = int(positions[i_last]) + 1
+            if (end_pos - start_pos) < minlen_bp:
+                continue
+
+            # All CpGs (sig + non-sig) inside [start_pos, end_pos).
+            i_span_lo = int(np.searchsorted(positions, start_pos, side="left"))
+            i_span_hi = int(np.searchsorted(positions, end_pos, side="left"))
+            n_cpgs_span = i_span_hi - i_span_lo
+            if n_cpgs_span < min_cpgs:
+                continue
+            n_sig_span = int(cum_sig[i_span_hi] - cum_sig[i_span_lo])
+            if n_sig_span / max(n_cpgs_span, 1) < pct_sig:
+                continue
+
+            span_pvals = pvals[i_span_lo:i_span_hi]
+            span_diffs = meth_diffs[i_span_lo:i_span_hi]
+            span_pos = positions[i_span_lo:i_span_hi]
+
+            valid_diffs = span_diffs[~np.isnan(span_diffs)]
+            if len(valid_diffs) == 0:
+                continue
+            n_hyper = int((valid_diffs > 0).sum())
+            n_hypo = int((valid_diffs < 0).sum())
+
+            combined_p = _stouffer_combine_signed(
+                span_pvals,
+                span_diffs,
+                positions=span_pos,
+                length_scale=chrom_lambda,
+            )
+            if np.isnan(combined_p):
+                continue
+
+            mean_diff = float(np.nanmean(span_diffs))
+            dmr_type = _classify_direction(mean_diff, n_hyper, n_hypo)
+
+            all_records.append(
+                {
+                    "chrom": chrom,
+                    "start": start_pos,
+                    "end": end_pos,
+                    "n_cpgs": n_cpgs_span,
+                    "n_significant": n_sig_span,
+                    "mean_meth_diff": float(np.float32(mean_diff)),
+                    "combined_pvalue": float(combined_p),
+                    "dmr_type": dmr_type,
+                }
+            )
+            chrom_dmrs += 1
+
+        logger.info(
+            "  %s: %d sig CpG(s) -> %d chain(s) -> %d DMR(s)",
+            chrom,
+            int(sig_idx.size),
+            len(chain_lo),
+            chrom_dmrs,
+        )
+        del chrom_df, positions, meth_diffs, pvals, sig_vals
+        del is_sig, is_sig_int, sig_idx, sig_pos, cum_sig
+        gc.collect()
+
+    if not all_records:
+        logger.warning("No DMRs found with current filters")
+        empty = pl.DataFrame(schema=_DMR_EMPTY_SCHEMA)
+        if dmr_cache_path is not None:
+            empty.write_parquet(str(dmr_cache_path))
+        return empty
+
+    dmr_df = (
+        pl.DataFrame(all_records)
+        .with_columns(
+            [
+                pl.col("start").cast(pl.Int32),
+                pl.col("end").cast(pl.Int32),
+                pl.col("n_cpgs").cast(pl.Int32),
+                pl.col("n_significant").cast(pl.Int32),
+                pl.col("mean_meth_diff").cast(pl.Float32),
+            ]
+        )
+        .sort(["chrom", "start"])
+    )
+
+    logger.info("chain_merge: correcting %d selected spans over %d admissible intervals (BY)",
+                len(dmr_df), family_size)
+    corrected = adjust_selected(dmr_df["combined_pvalue"].to_numpy(), family_size)
+    dmr_df = dmr_df.with_columns(
+        pl.Series("combined_qvalue", corrected),
+        pl.Series("combined_qvalue_reject", corrected <= .05),
+    )
+    if dmr_cache_path is not None:
+        dmr_df.write_parquet(str(dmr_cache_path))
+        logger.info(
+            "DMR chain-merge result cached at %s",
+            dmr_cache_path.name,
+        )
+    return dmr_df
+
+
+# Public API -- tile-based DMR calling
+
+
+def _aggregate_sample_to_tiles(
+    src_part_file: Path,
+    chrom: str,
+    tile_size_bp: int,
+) -> pl.DataFrame | None:
+    """Aggregate one sample/chromosome's per-CpG counts to per-tile sums.
+
+    Returns a DataFrame with columns: chrom, pos (= tile start), strand,
+    N_meth, N_unmeth, coverage, n_cpgs.  Or None when the source is missing.
+    """
+    if not src_part_file.exists():
+        return None
+
+    df = pl.read_parquet(str(src_part_file))
+    if len(df) == 0:
+        return None
+
+    # Tile assignment: pos // tile * tile gives left-inclusive boundary.
+    tile_col = (pl.col("pos") // tile_size_bp) * tile_size_bp
+    tiled = (
+        df.with_columns(tile_col.cast(pl.Int32).alias("tile_start"))
+        .group_by("tile_start")
+        .agg(
+            [
+                pl.sum("N_meth").alias("N_meth"),
+                pl.sum("coverage").alias("coverage"),
+                pl.len().alias("n_cpgs"),
+                # Preserve a strand value: first non-"*" if available, else "*"
+                (
+                    pl.when(pl.col("strand") != "*")
+                    .then(pl.col("strand"))
+                    .otherwise(None)
+                    .drop_nulls()
+                    .first()
+                ).alias("strand_real")
+                if "strand" in df.columns
+                else pl.lit("*").alias("strand_real"),
+            ]
+        )
+        .with_columns(
+            [
+                pl.lit(chrom).alias("chrom"),
+                pl.col("tile_start").alias("pos"),
+                pl.col("strand_real").fill_null("*").alias("strand"),
+                (pl.col("coverage") - pl.col("N_meth")).alias("N_unmeth"),
+            ]
+        )
+        .drop("tile_start", "strand_real")
+        .sort("pos")
+    )
+    return tiled
+
+
+def _merge_adjacent_tiles(dmr_df: pl.DataFrame) -> pl.DataFrame:
+    """Merge adjacent significant tiles on the same chromosome with same direction.
+
+    The combined p-value uses signed Stouffer with the correct two-sided
+    -> one-sided conversion ``z = isf(p/2)`` and a running ``(sum_z, n)``
+    accumulator so chains of length > 2 combine as ``sum_z / sqrt(n)``,
+    not by iterative pairwise /sqrt(2).
+    """
+    if dmr_df.is_empty():
+        return dmr_df
+
+    sorted_df = dmr_df.sort(["chrom", "start"])
+    rows = sorted_df.to_dicts()
+    merged: list[dict] = []
+    current: dict | None = None
+    current_sum_z = 0.0
+    current_n_z = 0
+
+    def _abs_z(p: float) -> float:
+        # Two-sided p -> magnitude of one-sided z; clamp p to avoid inf.
+        return float(sp_stats.norm.isf(max(p, 1e-300) / 2.0))
+
+    def _finalise(c: dict, sum_z: float, n_z: int) -> dict:
+        if n_z > 0:
+            var_z = float(n_z) + 2.0 * max(n_z - 1, 0) * 0.25
+            z_comb = sum_z / math.sqrt(var_z)
+            c["pvalue"] = float(2.0 * sp_stats.norm.sf(abs(z_comb)))
+        return c
+
+    for row in rows:
+        if current is None:
+            current = dict(row)
+            current["_count"] = 1
+            current_sum_z = _abs_z(row["pvalue"])
+            current_n_z = 1
+            continue
+        if (
+            row["chrom"] == current["chrom"]
+            and row["start"] <= current["end"]
+            and row["dmr_type"] == current["dmr_type"]
+        ):
+            prev_n = current["_count"]
+            current["end"] = row["end"]
+            current["n_cpgs"] = current["n_cpgs"] + row["n_cpgs"]
+            for col in ("meth_diff", "log2_odds_ratio", "mean_beta_case", "mean_beta_control"):
+                if col in current and current[col] is not None and row.get(col) is not None:
+                    current[col] = (current[col] * prev_n + row[col]) / (prev_n + 1)
+            for col in ("n_case", "n_control"):
+                if col in current and current[col] is not None and row.get(col) is not None:
+                    current[col] = max(current[col], row[col])
+            current_sum_z += _abs_z(row["pvalue"])
+            current_n_z += 1
+            current["_count"] = prev_n + 1
+        else:
+            merged.append(_finalise(current, current_sum_z, current_n_z))
+            current = dict(row)
+            current["_count"] = 1
+            current_sum_z = _abs_z(row["pvalue"])
+            current_n_z = 1
+    if current is not None:
+        merged.append(_finalise(current, current_sum_z, current_n_z))
+
+    for m in merged:
+        m.pop("_count", None)
+
+    if not merged:
+        return dmr_df.clear()
+
+    result = pl.DataFrame(merged, schema=dmr_df.schema)
+    from .dmc import apply_multiple_testing_correction
+
+    result = apply_multiple_testing_correction(result, method="fdr_bh")
+    return result.sort(["chrom", "start"])
+
+
+def _resolve_tile_chromosomes(
+    methylstore_path: str,
+    chromosomes: list[str] | None,
+    *,
+    canonical_only: bool = False,
+) -> list[str]:
+    """Return the chromosome universe a tile DMR run works on.
+
+    An explicit ``chromosomes`` list, including an empty one, is used
+    verbatim. Only the auto-detected set (``chromosomes=None``) is subject to
+    ``canonical_only``, which keeps the fixed human-style chromosomes of
+    :mod:`epykit._chroms` and logs one INFO line naming the dropped contigs.
+    ``tl.dmr`` resolves the list once so the observed run and every
+    permutation of :func:`empirical_fdr_for_dmr` test the same universe.
+    """
+    if chromosomes is not None:
+        return list(chromosomes)
+    store = Path(methylstore_path)
+    detected = sorted(
+        {d.name.removeprefix("chrom=") for s in store.glob("sample=*") for d in s.glob("chrom=*")}
+    )
+    if canonical_only:
+        return filter_canonical_logged(detected, context="dmr/tile")
+    return detected
+
+
+def call_dmr_tile_based(
+    methylstore_path: str,
+    samples_treatment: list[str] | None = None,
+    samples_control: list[str] | None = None,
+    tile_size_bp: int = 1000,
+    test: str = "lr",
+    chromosomes: list[str] | None = None,
+    min_cpgs_per_tile: int = 5,
+    alpha: float = 0.05,
+    min_abs_meth_diff: float = 0.1,
+    unite: bool = True,
+    min_samples_treatment: int | None = None,
+    min_samples_control: int = 0,
+    dispersion: str = "site",
+    reference: str = "chi2",
+    design_full: np.ndarray | None = None,
+    design_reduced: np.ndarray | None = None,
+    coef_idx: int | None = None,
+    *,
+    backend: str = "sequential",
+    n_workers: int | None = None,
+    merge_adjacent: bool = True,
+    canonical_only: bool = False,
+) -> pl.DataFrame:
+    """Call DMRs by aggregating read counts within fixed-size tiles.
+
+    Per-sample, per-chromosome, the engine sums N_meth and coverage across
+    all CpGs in each tile, then runs a single tile-level DMC test. The
+    sliding-window alternative tests each CpG individually and combines
+    p-values, which has dramatically lower power at typical WGBS coverage:
+    a tile with 20 CpGs at +15 % effect might have zero individually-
+    significant CpGs but still trivially pass when its 600 pooled reads
+    are tested.
+
+    Implementation
+    --------------
+    1. For each sample and chromosome, aggregate (N_meth, coverage) per tile
+       and write a "tiled methylstore" to a temp directory. Tiles with
+       fewer than ``min_cpgs_per_tile`` CpGs (in that sample) are dropped
+       before writing.
+    2. Run ``process_chromosomes_dmc`` on the tiled store with the requested
+       test. Tiles are treated as "sites" with pos = tile_start.
+    3. BH-correct the tile-level p-values.
+    4. Filter on qvalue and |meth_diff|.
+    5. Reshape into the DMR output schema.
+
+    Parameters
+    ----------
+    methylstore_path : str
+        Path to the filtered partitioned Parquet methylstore.
+    samples_treatment, samples_control : list[str]
+        Sample IDs.
+    tile_size_bp : int
+        Tile width in bp (default 1000). Adjacent tiles do not overlap.
+    test : str
+        Statistical test for tile-level counts. Defaults to ``"lr"``
+        (quasi-binomial likelihood-ratio), the recommended default
+        when tile-level pooled counts are available.
+    chromosomes : list[str], optional
+        Chromosomes to process. Auto-detected when None. An explicit list,
+        including an empty one, is used verbatim.
+    canonical_only : bool, keyword-only
+        When ``chromosomes`` is None, keep only the fixed human-style
+        chromosome set (``1``-``22``, ``X``, ``Y``, ``M``/``MT``, with or
+        without a ``chr`` prefix) of the auto-detected partitions, so
+        unplaced / alt contigs are excluded before the tile test and the
+        BH correction. Default False tests every detected partition.
+    min_cpgs_per_tile : int
+        Skip tiles with fewer than this many CpGs (per sample) during the
+        per-sample aggregation step. Default 5 to reduce noise at sparse
+        coverage.
+    alpha : float
+        q-value threshold for significance.
+    min_abs_meth_diff : float
+        Minimum |meth_diff| for a tile to be called significant.
+    unite : bool
+        If True (default), only test tiles covered in every sample.
+    min_samples_treatment, min_samples_control : int
+        Per-tile minimum number of samples required to be present in each
+        group (only relevant when unite=False).
+
+    Returns
+    -------
+    pl.DataFrame
+        Columns: chrom, start, end, n_cpgs, n_case, n_control,
+                 mean_beta_case, mean_beta_control, meth_diff,
+                 log2_odds_ratio, pvalue, qvalue, dmr_type.
+    """
+    from .dmc import (
+        apply_multiple_testing_correction,
+        process_chromosomes_dmc,
+    )
+
+    if samples_treatment is None:
+        raise TypeError("Missing required argument: samples_treatment")
+    if samples_control is None:
+        raise TypeError("Missing required argument: samples_control")
+    if min_samples_treatment is None:
+        min_samples_treatment = 0
+    samples_case = samples_treatment
+    min_samples_case = min_samples_treatment
+
+    store = Path(methylstore_path)
+    all_samples = samples_case + samples_control
+
+    chromosomes = _resolve_tile_chromosomes(
+        methylstore_path, chromosomes, canonical_only=canonical_only
+    )
+
+    if not chromosomes:
+        return pl.DataFrame(schema=_DMR_TILE_SCHEMA)
+
+    logger.info(
+        "call_dmr_tile_based: tile=%d bp, test=%s, n_case=%d, n_control=%d, "
+        "min_cpgs/tile=%d, alpha=%.3f, min_|Deltabeta|=%.2f, unite=%s",
+        tile_size_bp,
+        test,
+        len(samples_case),
+        len(samples_control),
+        min_cpgs_per_tile,
+        alpha,
+        min_abs_meth_diff,
+        unite,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="epykit_tile_") as tmpdir:
+        tile_store = Path(tmpdir) / "tiled_store"
+
+        # ----- Phase 1: aggregate per-sample, per-chromosome counts -----
+        # Track per-tile CpG counts (max across samples) for output column.
+        # Stored as {(chrom, tile_start): n_cpgs}.
+        tile_n_cpgs: dict[tuple[str, int], int] = {}
+
+        for sample in all_samples:
+            for chrom in chromosomes:
+                src = store / f"sample={sample}" / f"chrom={chrom}" / "part-0.parquet"
+                tiled = _aggregate_sample_to_tiles(src, chrom, tile_size_bp)
+                if tiled is None or len(tiled) == 0:
+                    continue
+                tiled = tiled.filter(pl.col("n_cpgs") >= min_cpgs_per_tile)
+                if len(tiled) == 0:
+                    continue
+
+                # Record per-tile CpG count (use max across samples so the
+                # output reflects the most CpG-dense observation of the
+                # tile).
+                for tile_start, n_cpgs_val in zip(
+                    tiled["pos"].to_list(), tiled["n_cpgs"].to_list(), strict=True
+                ):
+                    key = (chrom, int(tile_start))
+                    if n_cpgs_val > tile_n_cpgs.get(key, 0):
+                        tile_n_cpgs[key] = int(n_cpgs_val)
+
+                out_dir = tile_store / f"sample={sample}" / f"chrom={chrom}"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                (
+                    tiled.select(
+                        ["chrom", "pos", "strand", "N_meth", "N_unmeth", "coverage"]
+                    ).write_parquet(str(out_dir / "part-0.parquet"))
+                )
+
+        # ----- Phase 2: run DMC on the tiled store -----
+        if not list(tile_store.glob("sample=*/chrom=*/part-0.parquet")):
+            logger.warning("Tile aggregation produced no rows; returning empty DMR set")
+            return pl.DataFrame(schema=_DMR_TILE_SCHEMA)
+
+        tile_dmc = process_chromosomes_dmc(
+            methylstore_path=str(tile_store),
+            samples_treatment=samples_case,
+            samples_control=samples_control,
+            test=test,
+            chromosomes=chromosomes,
+            unite=unite,
+            min_samples_treatment=min_samples_case,
+            min_samples_control=min_samples_control,
+            dispersion=dispersion,
+            reference=reference,
+            design_full=design_full,
+            design_reduced=design_reduced,
+            coef_idx=coef_idx,
+            backend=backend,
+            n_workers=n_workers,
+        )
+
+    if len(tile_dmc) == 0:
+        return pl.DataFrame(schema=_DMR_TILE_SCHEMA)
+
+    # ----- Phase 3: BH at tile level -----
+    tile_dmc = apply_multiple_testing_correction(tile_dmc, method="fdr_bh")
+
+    # ----- Phase 4: filter and reshape -----
+    # Attach n_cpgs from the per-sample aggregation.
+    n_cpgs_rows = [{"chrom": c, "pos": p, "n_cpgs": n} for (c, p), n in tile_n_cpgs.items()]
+    n_cpgs_df = pl.DataFrame(
+        n_cpgs_rows,
+        schema={"chrom": pl.Utf8, "pos": pl.Int32, "n_cpgs": pl.Int32},
+    )
+
+    # P1-11: DMC output no longer has a real-valued 'log2_odds_ratio' column;
+    # the backend-specific names are 'log2_odds_ratio_pooled' (lr/fisher) and
+    # 'coef_treatment_log2' (glm).  Normalise to 'log2_odds_ratio' for the
+    # DMR output schema (DMR schema rename is deferred to 0.8).
+    _log2_src = (
+        "coef_treatment_log2"
+        if "coef_treatment_log2" in tile_dmc.columns
+        else "log2_odds_ratio_pooled"
+    )
+    if _log2_src in tile_dmc.columns:
+        tile_dmc = tile_dmc.with_columns(pl.col(_log2_src).alias("log2_odds_ratio"))
+
+    dmr_df = (
+        tile_dmc.join(n_cpgs_df, on=["chrom", "pos"], how="left")
+        .with_columns(pl.col("n_cpgs").fill_null(0))
+        .filter(
+            (pl.col("qvalue") < alpha)
+            & (pl.col("meth_diff").abs() >= min_abs_meth_diff)
+            & (~pl.col("pvalue").is_nan())
+        )
+        .with_columns(
+            [
+                pl.col("pos").alias("start"),
+                (pl.col("pos") + tile_size_bp).cast(pl.Int32).alias("end"),
+                pl.when(pl.col("meth_diff") > 0)
+                .then(pl.lit("hyper"))
+                .otherwise(pl.lit("hypo"))
+                .alias("dmr_type"),
+            ]
+        )
+    )
+
+    out_cols = [
+        "chrom",
+        "start",
+        "end",
+        "n_cpgs",
+        "n_case",
+        "n_control",
+        "mean_beta_case",
+        "mean_beta_control",
+        "meth_diff",
+        "log2_odds_ratio",
+        "pvalue",
+        "qvalue",
+        "dmr_type",
+    ]
+    # GLM path adds adjusted log-odds effect size for the treatment coefficient.
+    for extra in ("coef_treatment", "coef_se"):
+        if extra in dmr_df.columns:
+            out_cols.append(extra)
+    dmr_df = dmr_df.select(out_cols).sort(["chrom", "start"])
+
+    if merge_adjacent:
+        dmr_df = _merge_adjacent_tiles(dmr_df)
+
+    logger.info(
+        "Tile-based DMR: %s tiles -> %s significant DMRs", f"{len(tile_dmc):,}", f"{len(dmr_df):,}"
+    )
+
+    gc.collect()
+    return dmr_df
+
+
+# Permutation-based empirical FDR
+
+
+def _empirical_pvalues_from_null_pool(
+    *,
+    observed_pvalues: np.ndarray,
+    null_pvalues_pool: np.ndarray,
+    n_perm_used: int,
+) -> np.ndarray:
+    """Empirical p-values via count-of-null-at-or-below-observed.
+
+    Returns ``(n_null_at_or_below_observed + 1) / (n_perm_used + 1)`` per
+    observed p-value -- the standard pseudo-count adjustment.
+
+    The function is agnostic to *which* null statistic is passed in: callers
+    may pass a pooled null (every null p-value across every permutation) OR
+    a per-perm summary (e.g. the minimum null p-value of each permutation,
+    which is the max-T / Westfall-Young construction used by both
+    ``empirical_fdr_for_dmr`` and ``empirical_fdr_for_dmc``). The contract
+    the caller must honour is that ``n_perm_used`` equals the number of
+    independent permutation contributions reflected in ``null_pvalues_pool``
+    -- failed perms must be excluded from BOTH the array and the
+    denominator.
+
+    Parameters
+    ----------
+    observed_pvalues
+        Observed per-region (or per-site) p-values.
+    null_pvalues_pool
+        Null p-values from successful permutations only. May be a pooled
+        null (one entry per (perm, region)) or a per-perm summary (one
+        entry per perm) -- the caller chooses; the helper is agnostic.
+    n_perm_used
+        Number of permutations that produced at least one usable null
+        p-value. Failed permutations (zero null regions, exception in the
+        engine) MUST be excluded -- the denominator is ``n_perm_used + 1``,
+        not ``n_perm_requested + 1``. With ``n_perm_used = 0`` the function
+        returns an array of 1.0 (most conservative).
+    """
+    if null_pvalues_pool.size == 0 or n_perm_used <= 0:
+        return np.ones_like(observed_pvalues, dtype=np.float64)
+    sorted_null = np.sort(null_pvalues_pool)
+    counts = np.searchsorted(sorted_null, observed_pvalues, side="right")
+    return (counts.astype(np.float64) + 1.0) / (float(n_perm_used) + 1.0)
+
+
+def _stratified_permutation_assignment(
+    *,
+    strata_map: dict[str, list[str]],
+    samples_treatment: list[str],
+    samples_control: list[str],
+    rng: np.random.Generator,
+) -> tuple[list[str], list[str]]:
+    """Per-stratum k-of-n permutation.
+
+    For each stratum, randomly select k samples as treatment, where k equals
+    the original number of treatment samples in that stratum. The remaining
+    samples become control. Preserves per-stratum group sizes -- the
+    invariant pre-fix code violated by shuffling within strata and then
+    splitting globally.
+
+    NOTE: The contract that ``samples_treatment`` is consulted for membership
+    is load-bearing. Refactors that drop the original treatment set from
+    callers (e.g. ``empirical_fdr_for_dmr``) will silently break stratified
+    permutation -- the helper must be able to derive k_treat per stratum.
+    """
+    treat_set = set(samples_treatment)
+    perm_treat: list[str] = []
+    perm_ctrl: list[str] = []
+    for stratum_samples in strata_map.values():
+        k_treat = sum(1 for s in stratum_samples if s in treat_set)
+        shuffled = list(rng.permutation(stratum_samples))
+        perm_treat.extend(shuffled[:k_treat])
+        perm_ctrl.extend(shuffled[k_treat:])
+    return perm_treat, perm_ctrl
+
+
+def _permutation_assignment(
+    perm_idx: int,
+    *,
+    seed: int,
+    samples_treatment: list[str],
+    samples_control: list[str],
+    empirical_strata: dict[str, list[str]] | None,
+) -> tuple[list[str], list[str]]:
+    """Label assignment for permutation ``perm_idx``.
+
+    A local generator seeded with ``seed + perm_idx + 1`` keeps the
+    assignments deterministic under parallel execution. Shared by the tile
+    and chain_merge harnesses so both draw the same shuffles for the same
+    seed.
+    """
+    local_rng = np.random.default_rng(seed + perm_idx + 1)
+    if empirical_strata is not None:
+        return _stratified_permutation_assignment(
+            strata_map=empirical_strata,
+            samples_treatment=samples_treatment,
+            samples_control=samples_control,
+            rng=local_rng,
+        )
+    shuffled = list(samples_treatment) + list(samples_control)
+    local_rng.shuffle(shuffled)
+    n_treat = len(samples_treatment)
+    return shuffled[:n_treat], shuffled[n_treat:]
+
+
+def _is_self_or_mirror_perm(
+    *,
+    perm_treatment: list[str],
+    observed_treatment: list[str],
+    observed_control: list[str],
+) -> bool:
+    """True if a permutation reproduces the observed contrast or its mirror.
+
+    A shuffle whose treatment set equals the observed treatment set (self)
+    or the observed control set (mirror swap) yields statistics identical to
+    the observed run; for a two-sided test the mirror gives the same
+    p-values. Such draws are not samples from the label-permutation null.
+    Counting them biases the decoy survivor count toward the observed run
+    and inflates the empirical FDR, which matters most at small n where
+    these draws are likely.
+    """
+    perm_set = set(perm_treatment)
+    return perm_set == set(observed_treatment) or perm_set == set(observed_control)
+
+
+# Permutation results carried from the per-permutation engines to the
+# aggregation step: ``(is_self_or_mirror, survivor_pvalues)``. The array is
+# ``None`` when the engine failed for that permutation and empty when it ran
+# cleanly and produced no surviving region.
+_PermResult = tuple[bool, "np.ndarray | None"]
+
+_REGION_FDR_METHODS = ("max_t", "region")
+
+
+def _validate_permutation_request(fdr_method: str, n_perm: int) -> None:
+    """Reject an unknown ``fdr_method`` or a non-positive ``n_perm`` before
+    any permutation runs."""
+    if fdr_method not in _REGION_FDR_METHODS:
+        raise ValueError(
+            f"fdr_method must be 'max_t' (Westfall-Young min-P, the default) "
+            f"or 'region' (count-ratio target-decoy FDR); got {fdr_method!r}."
+        )
+    if n_perm <= 0:
+        raise ValueError(f"n_perm must be a positive integer; got {n_perm!r}.")
+
+
+def _warn_if_region_underpowered(fdr_method: str, n_treat: int, n_ctrl: int, *, label: str) -> None:
+    """Region mode needs enough distinct label assignments to be informative."""
+    if fdr_method == "region" and min(n_treat, n_ctrl) < 4:
+        warnings.warn(
+            f"{label}: permutation FDR at n={min(n_treat, n_ctrl)} per group is "
+            f"underpowered. Only a handful of distinct label assignments exist "
+            f"and draws adjacent to the true split leak signal into the null, "
+            f"so the empirical FDR is conservative (biased high). Treat the "
+            f"result as a floor.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
+def _empty_empirical_columns(observed_dmr: pl.DataFrame) -> pl.DataFrame:
+    return observed_dmr.with_columns(
+        [
+            pl.lit(None, dtype=pl.Float64).alias("empirical_pvalue"),
+            pl.lit(None, dtype=pl.Float64).alias("empirical_qvalue"),
+            pl.lit(None, dtype=pl.Float64).alias("empirical_fdr_set"),
+        ]
+    )
+
+
+def _run_permutations(run_one, n_perm: int, n_jobs: int) -> list[_PermResult]:
+    """Run ``run_one(perm_idx)`` for every permutation, serially or via joblib."""
+    if n_jobs == 1:
+        return [run_one(i) for i in range(n_perm)]
+    try:
+        from joblib import Parallel, delayed
+    except ImportError:
+        logger.warning("joblib not installed; falling back to serial execution.")
+        return [run_one(i) for i in range(n_perm)]
+    return list(Parallel(n_jobs=n_jobs)(delayed(run_one)(i) for i in range(n_perm)))
+
+
+def _region_count_ratio_fdr(
+    *,
+    observed_pvalues: np.ndarray,
+    null_pools: list[np.ndarray],
+    n_perm_used: int,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Count-ratio (target-decoy) empirical FDR for region calls.
+
+    Caller-agnostic core: works for any DMR caller that emits a set of
+    observed survivor regions (each with a raw p-value) plus per-permutation
+    null survivor pools produced by the same calling and filtering pipeline.
+    This is the BSmooth (Hansen 2012) / SAM (Tusher 2001) region-level
+    empirical FDR.
+
+    Over ``n_perm_used`` label shuffles, with observed survivors the
+    "targets" and permutation survivors the "decoys"::
+
+        R(t)   = #{observed survivors with p <= t}
+        V(t)   = (1 / n_perm_used) * #{pooled null survivors with p <= t}
+        fdr(t) = V(t) / R(t)
+
+    The per-region q-value is the monotone suffix-min of ``fdr(t)`` for
+    ``t >= p_j``, clipped to ``[0, 1]``. Because decoys inherit the same
+    overdispersion as the observed scan, the inflation that makes the
+    asymptotic per-region p-value anti-conservative cancels in the ratio.
+
+    Parameters
+    ----------
+    observed_pvalues
+        Raw per-region p-values of the observed survivors (any order; the
+        output is returned in the same order).
+    null_pools
+        One array per usable permutation, holding that permutation's null
+        survivor p-values. Self/mirror permutations and failed runs must be
+        excluded by the caller. A clean zero-survivor permutation is passed
+        as an empty array: it contributes 0 to ``V`` and stays counted in
+        ``n_perm_used``.
+    n_perm_used
+        Number of permutations reflected in ``null_pools`` (the divisor for
+        ``V`` and the set-level mean). ``<= 0`` yields NaN estimates.
+
+    Returns
+    -------
+    (empirical_pvalue, empirical_qvalue, fdr_set)
+        ``empirical_pvalue`` is the pooled-null tail fraction
+        ``#{null <= p_j} / N_null`` per observed region, a diagnostic rather
+        than a calibrated per-region p-value. ``empirical_qvalue`` is the
+        per-region count-ratio q-value (threshold this). ``fdr_set`` is the
+        single set-level FDR ``min(mean(V) / R, 1)``; NaN when there are no
+        observed regions or no usable permutations.
+    """
+    observed_pvalues = np.asarray(observed_pvalues, dtype=np.float64)
+    n_obs = observed_pvalues.size
+    if n_obs == 0:
+        return (np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64), float("nan"))
+
+    if n_perm_used <= 0 or len(null_pools) == 0:
+        nan = np.full(n_obs, np.nan, dtype=np.float64)
+        return (nan.copy(), nan.copy(), float("nan"))
+
+    null_sizes = np.array([np.asarray(p).size for p in null_pools], dtype=np.float64)
+    if null_sizes.sum() > 0:
+        pooled_null = np.sort(
+            np.concatenate([np.asarray(p, dtype=np.float64).ravel() for p in null_pools])
+        )
+    else:
+        pooled_null = np.empty(0, dtype=np.float64)
+    n_null = pooled_null.size
+    fdr_set = float(min(null_sizes.mean() / n_obs, 1.0))
+
+    # empirical_pvalue: pooled-null tail fraction per observed region.
+    if n_null == 0:
+        emp_p = np.zeros(n_obs, dtype=np.float64)
+    else:
+        emp_p = np.searchsorted(pooled_null, observed_pvalues, side="right") / n_null
+
+    # count-ratio q over sorted observed thresholds, then map back to input order.
+    order = np.argsort(observed_pvalues, kind="mergesort")
+    t_sorted = observed_pvalues[order]
+    r_t = np.arange(1, n_obs + 1, dtype=np.float64)
+    v_t = np.searchsorted(pooled_null, t_sorted, side="right") / float(n_perm_used)
+    fdr_t = np.clip(v_t / r_t, 0.0, 1.0)
+    q_sorted = np.minimum.accumulate(fdr_t[::-1])[::-1]  # monotone suffix-min
+    emp_q = np.empty(n_obs, dtype=np.float64)
+    emp_q[order] = q_sorted
+    return (emp_p, emp_q, fdr_set)
+
+
+def _aggregate_region_perm_results(
+    *,
+    observed_pvalues: np.ndarray,
+    results: list[_PermResult],
+    n_perm: int,
+    fdr_method: str,
+    label: str = "region-fdr",
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Shared permutation-FDR aggregation for any region caller.
+
+    ``results`` holds one ``(is_self_or_mirror, survivor_pvalues or None)``
+    per permutation; ``None`` means the engine failed for that permutation.
+    Returns ``(empirical_pvalue, empirical_qvalue, fdr_set)`` aligned with
+    ``observed_pvalues``. Non-finite observed p-values come back as NaN in
+    both mode.
+
+    ``fdr_method="max_t"`` uses one minimum score per complete label-shuffled
+    scan, including empty scans (+infinity). Failed scans abort inference.
+    The +1 Monte Carlo correction is applied once; empirical_qvalue is a
+    compatibility alias for the scan-adjusted p-value, without a second BH.
+    Complete-null family-wise control requires exchangeable sample labels.
+
+    ``fdr_method="region"`` is the count-ratio target-decoy FDR of
+    :func:`_region_count_ratio_fdr`: self/mirror assignments and failed
+    runs are excluded, a clean zero-survivor run counts as a zero
+    contribution, and zero usable assignments yield NaN estimates with a
+    ``UserWarning``.
+    """
+    obs_p = np.asarray(observed_pvalues, dtype=np.float64)
+    obs_finite_mask = np.isfinite(obs_p)
+    obs_safe = np.where(obs_finite_mask, obs_p, 1.0)
+
+    if fdr_method == "region":
+        n_self = sum(1 for is_self, _ in results if is_self)
+        n_failed = sum(1 for is_self, arr in results if (not is_self) and arr is None)
+        null_pools = [arr for is_self, arr in results if (not is_self) and arr is not None]
+        n_perm_used = len(null_pools)
+        if n_self or n_failed:
+            logger.info(
+                "%s[region]: excluded %d self/mirror and %d failed permutation(s); n_perm_used=%d.",
+                label,
+                n_self,
+                n_failed,
+                n_perm_used,
+            )
+        if n_perm_used == 0:
+            warnings.warn(
+                f"{label}: all {n_perm} permutations were self/mirror assignments "
+                f"or failed; the region empirical FDR is undefined and is "
+                f"reported as NaN. Raise n_perm or use larger groups.",
+                UserWarning,
+                stacklevel=3,
+            )
+        finite_p, finite_q, fdr_set = _region_count_ratio_fdr(
+            observed_pvalues=obs_p[obs_finite_mask],
+            null_pools=null_pools,
+            n_perm_used=n_perm_used,
+        )
+        # Missing statistics must not count as observed survivors or lower
+        # finite regions' q-values through the suffix minimum.
+        emp_p = np.full_like(obs_p, np.nan)
+        emp_q = np.full_like(obs_p, np.nan)
+        emp_p[obs_finite_mask] = finite_p
+        emp_q[obs_finite_mask] = finite_q
+        logger.info("%s[region]: set-level FDR=%.4f", label, fdr_set)
+        return emp_p, emp_q, fdr_set
+
+    # A successful empty scan is a null maximum of -infinity (min-P of
+    # +infinity). It MUST remain in the randomization denominator. Failed
+    # permutations cannot be omitted conditionally on computational success.
+    if len(results) != n_perm or any(arr is None for _, arr in results):
+        raise RuntimeError("Incomplete permutation scan; refusing biased inference")
+    usable = [np.asarray(arr, dtype=float) for _, arr in results]
+    if any(np.any(~np.isfinite(arr)) or np.any((arr < 0) | (arr > 1)) for arr in usable):
+        raise ValueError("Invalid permutation region scores")
+    minima = np.array([float(arr.min()) if arr.size else np.inf for arr in usable])
+    # Uniform Monte Carlo assignments include self/mirror draws. The +1
+    # correction includes the observed assignment and prevents zero p-values.
+    emp_p = (1 + np.searchsorted(np.sort(minima), obs_safe, side="right")) / (n_perm + 1)
+    emp_p = np.where(obs_finite_mask, emp_p, np.nan)
+    # Already adjusted for the complete scan; a second BH step is unnecessary.
+    # This gives complete-null family-wise control under exchangeability.
+    # Strong FWER under partial alternatives needs additional assumptions.
+    return emp_p, emp_p.copy(), float("nan")
+
+
+def empirical_fdr_for_dmr(
+    methylstore_path: str,
+    samples_treatment: list[str],
+    samples_control: list[str],
+    observed_dmr: pl.DataFrame,
+    *,
+    n_perm: int = 100,
+    seed: int = 42,
+    n_jobs: int = 1,
+    empirical_strata: dict[str, list[str]] | None = None,
+    merge_adjacent: bool = True,
+    backend: str = "sequential",
+    fdr_method: Literal["max_t", "region"] = "max_t",
+    min_mean_qvalue: float | None = None,
+    **dmr_kwargs,
+) -> pl.DataFrame:
+    """Empirical (permutation) FDR for tile-based DMRs.
+
+    Re-runs ``call_dmr_tile_based`` ``n_perm`` times with treatment / control
+    labels shuffled and compares the observed survivor tiles against the
+    permutation (decoy) survivors. Two constructions are available through
+    ``fdr_method``:
+
+    - ``"max_t"`` (default): Westfall-Young min-P. ``empirical_pvalue`` is
+      the fraction of permutations whose genome-wide minimum null p-value is
+      ``<=`` the observed p-value, and ``empirical_qvalue`` is its BH
+      transform. This controls the family-wise error rate and is very
+      conservative at genome scale under realistic dispersion.
+    - ``"region"``: count-ratio target-decoy FDR (BSmooth / SAM).
+      ``empirical_qvalue`` is the monotone suffix-min of
+      ``mean(#null survivors with p <= t) / (#observed survivors with p <= t)``.
+      Because the decoys inherit the observed overdispersion, the inflation
+      cancels in the ratio. Self/mirror assignments and failed permutations
+      are excluded from the null; a clean zero-survivor permutation counts
+      as a zero contribution. ``empirical_pvalue`` is the pooled-null tail
+      fraction, a diagnostic rather than a calibrated per-tile p-value. The
+      set-level FDR ``mean(#null survivors) / #observed`` is returned in the
+      constant ``empirical_fdr_set`` column.
+
+    Parameters
+    ----------
+    methylstore_path, samples_treatment, samples_control
+        Same arguments passed to :func:`call_dmr_tile_based`.
+    observed_dmr
+        The DMR DataFrame returned by the observed (unpermuted) run.
+        Empirical columns are appended to a copy of this frame.
+    min_mean_qvalue
+        The q-value post-filter applied to the observed tiles. Each
+        permutation applies the same cutoff before counting survivors.
+        None disables this extra filter.
+    n_perm
+        Number of permutations. Must be positive.
+    seed
+        Seed for the per-permutation label shuffler.
+    n_jobs
+        joblib parallel worker count. -1 uses all cores. Falls back to
+        serial execution when joblib is not installed.
+    empirical_strata : dict[str, list[str]] or None
+        When supplied, a mapping from stratum label to the list of sample
+        IDs belonging to that stratum.  Labels are shuffled **within** each
+        stratum rather than globally.  Build this dict from ``md.obs`` in
+        the caller (see :func:`epykit.tl.dmr`).  When ``None`` (default),
+        the standard global shuffle is used.
+    merge_adjacent
+        Forwarded to each per-permutation ``call_dmr_tile_based`` call.
+        Must match the observed run; otherwise observed and null regions
+        are computed under different merge rules and ``empirical_pvalue``
+        is distorted (m-perm-2).
+    backend
+        Forwarded to each per-permutation ``call_dmr_tile_based`` call.
+        Must match the observed run for the same reason as
+        ``merge_adjacent``.
+    fdr_method : {"max_t", "region"}
+        ``"max_t"`` (default) keeps the min-P construction; ``"region"``
+        selects the count-ratio FDR. See the summary above.
+    **dmr_kwargs
+        Forwarded to ``call_dmr_tile_based`` for each permutation; should
+        match the observed run's settings (tile_size_bp, test, alpha,
+        min_abs_meth_diff, dispersion, reference, chromosomes,
+        canonical_only, etc.). Pass the resolved ``chromosomes`` list of
+        the observed run so every permutation tests the same universe.
+
+    Returns
+    -------
+    pl.DataFrame
+        ``observed_dmr`` with added columns ``empirical_pvalue``,
+        ``empirical_qvalue`` and the constant ``empirical_fdr_set`` (the
+        set-level count-ratio FDR in ``"region"`` mode; NaN in ``"max_t"``).
+    """
+    _validate_permutation_request(fdr_method, n_perm)
+
+    if len(observed_dmr) == 0:
+        return _empty_empirical_columns(observed_dmr)
+
+    n_treat = len(samples_treatment)
+    n_ctrl = len(samples_control)
+    if n_treat == 1 and n_ctrl == 1:
+        raise ValueError(
+            "empirical DMR FDR requires n>=2 per group; got n_treat=1, "
+            "n_ctrl=1. Use Fisher-derived p-values directly via "
+            "tl.dmc(test='fisher')."
+        )
+    _warn_if_region_underpowered(fdr_method, n_treat, n_ctrl, label="empirical_fdr_for_dmr")
+
+    def _run_one_perm(perm_idx: int) -> _PermResult:
+        perm_treat, perm_ctrl = _permutation_assignment(
+            perm_idx,
+            seed=seed,
+            samples_treatment=samples_treatment,
+            samples_control=samples_control,
+            empirical_strata=empirical_strata,
+        )
+        is_self = _is_self_or_mirror_perm(
+            perm_treatment=perm_treat,
+            observed_treatment=samples_treatment,
+            observed_control=samples_control,
+        )
+        # Force test='lr' or whatever observed used; do not run annotation.
+        kwargs = dict(dmr_kwargs)
+        kwargs.pop("samples_case", None)
+        kwargs.pop("min_samples_case", None)
+        # Defensive: if a caller accidentally also threads merge_adjacent /
+        # backend / fdr_method through **dmr_kwargs, prefer the explicit
+        # named params so we never double-pass or leak into the tile caller.
+        kwargs.pop("merge_adjacent", None)
+        kwargs.pop("backend", None)
+        kwargs.pop("fdr_method", None)
+        try:
+            null_df = call_dmr_tile_based(
+                methylstore_path=methylstore_path,
+                samples_treatment=perm_treat,
+                samples_control=perm_ctrl,
+                merge_adjacent=merge_adjacent,
+                backend=backend,
+                **kwargs,
+            )
+            null_df = apply_region_qfilter(null_df, min_mean_qvalue, candidate_cols=("qvalue",))
+        except Exception as exc:
+            logger.warning("permutation %d failed: %s", perm_idx, exc)
+            return (is_self, None)
+        if "pvalue" not in null_df.columns or len(null_df) == 0:
+            return (is_self, np.array([], dtype=np.float64))
+        return (is_self, null_df.get_column("pvalue").drop_nulls().to_numpy())
+
+    results = _run_permutations(_run_one_perm, n_perm, n_jobs)
+    emp_p, emp_q, fdr_set = _aggregate_region_perm_results(
+        observed_pvalues=observed_dmr.get_column("pvalue").to_numpy(),
+        results=results,
+        n_perm=n_perm,
+        fdr_method=fdr_method,
+        label="empirical_fdr_for_dmr",
+    )
+    return observed_dmr.with_columns(
+        [
+            pl.Series("empirical_pvalue", emp_p),
+            pl.Series("empirical_qvalue", emp_q),
+            pl.lit(fdr_set, dtype=pl.Float64).alias("empirical_fdr_set"),
+        ]
+    )
+
+
+# chain_merge permutation harness
+
+# DMC engines whose per-CpG test depends only on the two-group split, so a
+# label shuffle is a valid permutation of the observed analysis.
+CHAIN_MERGE_PERM_DMC_TESTS = frozenset({"lr", "welch_t", "fisher"})
+
+# ``process_chromosomes_dmc`` knobs a caller may replay through ``dmc_kwargs``.
+# The chromosome universe, output directory and the design / contrast inputs
+# are owned by the harness or rejected outright.
+_CHAIN_MERGE_PERM_DMC_KWARGS = frozenset(
+    {
+        "test",
+        "unite",
+        "min_samples_treatment",
+        "min_samples_control",
+        "dispersion",
+        "reference",
+        "smoothing",
+        "smoothing_span_bp",
+        "sep_fallback",
+        "sep_threshold",
+        "backend",
+        "n_workers",
+    }
+)
+
+
+def _validate_chain_merge_perm_dmc_kwargs(dmc_kwargs: dict[str, Any]) -> None:
+    unknown = sorted(set(dmc_kwargs) - _CHAIN_MERGE_PERM_DMC_KWARGS)
+    if unknown:
+        raise ValueError(
+            f"dmc_kwargs may only carry the two-group DMC knobs "
+            f"{sorted(_CHAIN_MERGE_PERM_DMC_KWARGS)}; got unsupported "
+            f"key(s) {unknown}. GLM / contrast designs cannot be permuted by "
+            f"label shuffling, and the chromosome universe is passed as "
+            f"chromosomes=."
+        )
+    test = dmc_kwargs.get("test")
+    if test not in CHAIN_MERGE_PERM_DMC_TESTS:
+        raise NotImplementedError(
+            f"chain_merge empirical_fdr supports the two-group DMC tests "
+            f"{sorted(CHAIN_MERGE_PERM_DMC_TESTS)}; got test={test!r}."
+        )
+
+
+def _chain_merge_perm_survivors(
+    *,
+    methylstore_path: str,
+    samples_treatment: list[str],
+    samples_control: list[str],
+    chromosomes: list[str],
+    dmc_kwargs: dict[str, Any],
+    dmc_fdr_method: str,
+    chain_merge_kwargs: dict[str, Any],
+    min_mean_qvalue: float | None,
+) -> np.ndarray | None:
+    """Per-permutation engine for :func:`empirical_fdr_for_chain_merge`.
+
+    Replays the observed analysis under one label assignment: streams the
+    per-CpG DMC for ``chromosomes`` into a private temporary store, applies
+    the observed multiple-testing correction, chain-merges from that store
+    and applies the same region q-filter. Returns the surviving regions'
+    ``combined_pvalue``; ``None`` on engine failure and an empty array on a
+    clean zero-survivor run.
+
+    The temporary store is removed before returning, so the observed
+    ``DMCStore`` (and its chain_merge cache files) is never touched, whatever
+    ``n_jobs`` is. Only the raw ``pvalue`` / ``qvalue`` columns are written,
+    which is what ``call_dmr_chain_merge`` reads; neighbour-combined columns
+    are never substituted. A module-level function so tests can monkeypatch
+    it without recomputing a genome-wide DMC.
+    """
+    from .dmc import apply_multiple_testing_correction, process_chromosomes_dmc
+
+    with tempfile.TemporaryDirectory(prefix="epykit_dmr_perm_") as perm_dir:
+        try:
+            store = process_chromosomes_dmc(
+                methylstore_path=methylstore_path,
+                samples_treatment=samples_treatment,
+                samples_control=samples_control,
+                chromosomes=list(chromosomes),
+                out_dir=perm_dir,
+                return_store=True,
+                **dmc_kwargs,
+            )
+            store = apply_multiple_testing_correction(store, method=dmc_fdr_method)
+            region_df = call_dmr_chain_merge(store, **chain_merge_kwargs)
+        except Exception as exc:
+            logger.warning("chain_merge permutation failed: %s", exc)
+            return None
+    region_df = apply_region_qfilter(region_df, min_mean_qvalue)
+    if "combined_pvalue" not in region_df.columns or len(region_df) == 0:
+        return np.array([], dtype=np.float64)
+    return region_df.get_column("combined_pvalue").drop_nulls().to_numpy()
+
+
+def empirical_fdr_for_chain_merge(
+    methylstore_path: str,
+    samples_treatment: list[str],
+    samples_control: list[str],
+    observed_dmr: pl.DataFrame,
+    *,
+    chromosomes: list[str],
+    dmc_kwargs: dict[str, Any],
+    chain_merge_kwargs: dict[str, Any],
+    dmc_fdr_method: str = "fdr_bh",
+    min_mean_qvalue: float | None = 0.05,
+    n_perm: int = 100,
+    seed: int = 42,
+    n_jobs: int = 1,
+    empirical_strata: dict[str, list[str]] | None = None,
+    fdr_method: Literal["max_t", "region"] = "max_t",
+) -> pl.DataFrame:
+    """Empirical (permutation) FDR for chain_merge DMRs.
+
+    Replays the observed chain_merge analysis on ``n_perm`` label shuffles.
+    Each permutation recomputes the per-CpG DMC for the observed chromosome
+    universe (``chromosomes``) with the observed engine knobs
+    (``dmc_kwargs``), applies the observed multiple-testing correction
+    (``dmc_fdr_method``), chain-merges with ``chain_merge_kwargs`` and
+    applies the same ``min_mean_qvalue`` region filter. The surviving
+    regions' ``combined_pvalue`` values form the decoy pool that
+    :func:`_aggregate_region_perm_results` compares with the observed
+    survivors, with the same ``fdr_method`` semantics as
+    :func:`empirical_fdr_for_dmr` (``"max_t"`` default, ``"region"``
+    opt-in).
+
+    Each permutation recomputes the genome-wide per-CpG DMC, so a
+    whole-genome run with the default ``n_perm`` can take hours. The cost
+    is logged once per run at INFO. Raise ``n_jobs`` to parallelise, or
+    rerun ``ep.tl.dmc`` with ``chromosomes=`` to shrink the universe.
+
+    Parameters
+    ----------
+    methylstore_path, samples_treatment, samples_control
+        The methylstore and the observed two-group split, as passed to
+        :func:`process_chromosomes_dmc` for the observed run.
+    observed_dmr
+        The chain_merge DMR table of the observed run after the region
+        q-filter. Empirical columns are appended to a copy of this frame.
+    chromosomes
+        The observed DMC chromosome universe (``DMCStore.chroms()`` or the
+        distinct chromosomes of the materialized DMC table). Every
+        permutation tests exactly these chromosomes so observed and decoy
+        survivors come from the same scan.
+    dmc_kwargs
+        Observed ``process_chromosomes_dmc`` knobs to replay: ``test``
+        (``"lr"``, ``"welch_t"`` or ``"fisher"``), ``unite``,
+        ``min_samples_treatment``, ``min_samples_control``, ``dispersion``,
+        ``reference``, ``smoothing``, ``smoothing_span_bp``,
+        ``sep_fallback``, ``sep_threshold`` and optionally ``backend`` /
+        ``n_workers``. ``tl.dmr`` builds this from ``md.uns["dmc"]``. GLM,
+        contrast and design inputs are rejected before any work.
+    chain_merge_kwargs
+        Forwarded to :func:`call_dmr_chain_merge` for each permutation.
+        Must match the observed call (preset, alpha, dis_merge_bp,
+        min_cpgs, pct_sig, minlen_bp, use_q_for_sig).
+    dmc_fdr_method
+        The observed DMC multiple-testing method (``md.uns["dmc"]
+        ["fdr_method"]``). Applied to every permutation store before
+        chain-merging so a ``use_q_for_sig=True`` gate sees comparable
+        q-values. This is a DMC correction method, not the DMR
+        ``fdr_method``.
+    min_mean_qvalue
+        The region q-filter applied to both observed and permutation regions.
+    n_perm, seed, n_jobs, empirical_strata
+        As in :func:`empirical_fdr_for_dmr`.
+    fdr_method : {"max_t", "region"}
+        As in :func:`empirical_fdr_for_dmr`.
+
+    Returns
+    -------
+    pl.DataFrame
+        ``observed_dmr`` plus ``empirical_pvalue``, ``empirical_qvalue`` and
+        the constant ``empirical_fdr_set`` column.
+    """
+    _validate_permutation_request(fdr_method, n_perm)
+    _validate_chain_merge_perm_dmc_kwargs(dmc_kwargs)
+    if not chromosomes:
+        raise ValueError(
+            "chromosomes must list the observed DMC chromosome universe; got an empty list."
+        )
+    from .dmc import _VALID_FDR_METHODS
+
+    if dmc_fdr_method not in _VALID_FDR_METHODS:
+        raise ValueError(
+            f"dmc_fdr_method must be one of {sorted(_VALID_FDR_METHODS)}; got {dmc_fdr_method!r}."
+        )
+
+    if len(observed_dmr) == 0:
+        return _empty_empirical_columns(observed_dmr)
+
+    n_treat = len(samples_treatment)
+    n_ctrl = len(samples_control)
+    if n_treat == 1 and n_ctrl == 1:
+        raise ValueError(
+            "empirical chain_merge FDR requires n>=2 per group; got n_treat=1, n_ctrl=1."
+        )
+    _warn_if_region_underpowered(fdr_method, n_treat, n_ctrl, label="empirical_fdr_for_chain_merge")
+    logger.info(
+        "empirical_fdr_for_chain_merge: each of %d permutations recomputes the "
+        "per-CpG DMC (test=%s) over %d chromosome(s) before chain-merging; "
+        "whole-genome runs can take hours. Raise n_jobs to parallelise.",
+        n_perm,
+        dmc_kwargs.get("test"),
+        len(chromosomes),
+    )
+
+    def _run_one_perm(perm_idx: int) -> _PermResult:
+        perm_treat, perm_ctrl = _permutation_assignment(
+            perm_idx,
+            seed=seed,
+            samples_treatment=samples_treatment,
+            samples_control=samples_control,
+            empirical_strata=empirical_strata,
+        )
+        is_self = _is_self_or_mirror_perm(
+            perm_treatment=perm_treat,
+            observed_treatment=samples_treatment,
+            observed_control=samples_control,
+        )
+        arr = _chain_merge_perm_survivors(
+            methylstore_path=methylstore_path,
+            samples_treatment=perm_treat,
+            samples_control=perm_ctrl,
+            chromosomes=chromosomes,
+            dmc_kwargs=dmc_kwargs,
+            dmc_fdr_method=dmc_fdr_method,
+            chain_merge_kwargs=chain_merge_kwargs,
+            min_mean_qvalue=min_mean_qvalue,
+        )
+        return (is_self, arr)
+
+    results = _run_permutations(_run_one_perm, n_perm, n_jobs)
+    emp_p, emp_q, fdr_set = _aggregate_region_perm_results(
+        observed_pvalues=observed_dmr.get_column("combined_pvalue").to_numpy(),
+        results=results,
+        n_perm=n_perm,
+        fdr_method=fdr_method,
+        label="empirical_fdr_for_chain_merge",
+    )
+    return observed_dmr.with_columns(
+        [
+            pl.Series("empirical_pvalue", emp_p),
+            pl.Series("empirical_qvalue", emp_q),
+            pl.lit(fdr_set, dtype=pl.Float64).alias("empirical_fdr_set"),
+        ]
+    )
+
+
+# BSmooth-style local-polynomial smoother (spec-faithful)
+
+# Compiled-on-first-call helper. Numba is a core epykit dep but is otherwise
+# unused; we import lazily so a numba-less debug install (uncommon) still
+# falls back to a pure-numpy path.
+_BSMOOTH_NJIT_FN = None
+
+
+def _bsmooth_make_njit():
+    """Build and cache the numba-compiled per-chrom BSmooth kernel."""
+    global _BSMOOTH_NJIT_FN
+    if _BSMOOTH_NJIT_FN is not None:
+        return _BSMOOTH_NJIT_FN
+    try:
+        from numba import njit
+    except ImportError:
+        njit = None
+
+    def _bsmooth_one_chrom(
+        positions: np.ndarray,  # (n,) float64, sorted ascending
+        n_meth: np.ndarray,  # (n,) float64
+        coverage: np.ndarray,  # (n,) float64
+        ns: int,
+        h_min: float,
+        degree: int,
+        min_cpgs_for_smooth: int,
+    ) -> np.ndarray:
+        """Local-polynomial smoother -- one chromosome, one sample.
+
+        Per site i:
+          * adaptive half-window h_i = max(distance to ns-th nearest CpG, h_min)
+          * weights w_j = tricube(|x_j - x_i| / h_i) * coverage_j
+          * weighted least squares of degree `degree` (1 or 2), centered at x_i
+          * smoothed value = polynomial intercept, clipped to [0, 1]
+
+        Sites with zero coverage anywhere in the window contribute zero weight.
+        Sites with fewer than ``min_cpgs_for_smooth`` valid neighbors fall back
+        to the raw beta.
+        """
+        n = positions.shape[0]
+        out = np.full(n, np.nan, dtype=np.float64)
+
+        # Raw beta (NaN where coverage == 0)
+        beta_raw = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            if coverage[i] > 0.0:
+                beta_raw[i] = n_meth[i] / coverage[i]
+            else:
+                beta_raw[i] = np.nan
+
+        for i in range(n):
+            x_i = positions[i]
+
+            # ---- 1. Find ns-th nearest CpG distance via two-pointer expand
+            a = i
+            b = i
+            while (b - a + 1) < ns and (a > 0 or b < n - 1):
+                d_left = x_i - positions[a - 1] if a > 0 else np.inf
+                d_right = positions[b + 1] - x_i if b < n - 1 else np.inf
+                if d_left <= d_right:
+                    a -= 1
+                else:
+                    b += 1
+
+            if (b - a + 1) >= ns:
+                ns_dist = positions[b] - x_i
+                if x_i - positions[a] > ns_dist:
+                    ns_dist = x_i - positions[a]
+            else:
+                ns_dist = 0.0  # very small chrom; fall through to h_min
+
+            h_i = h_min if ns_dist < h_min else ns_dist
+
+            # ---- 2. Widen [lo, hi] to all CpGs within h_i of x_i
+            lo = a
+            hi = b
+            while lo > 0 and (x_i - positions[lo - 1]) <= h_i:
+                lo -= 1
+            while hi < n - 1 and (positions[hi + 1] - x_i) <= h_i:
+                hi += 1
+
+            # ---- 3. Accumulate weighted moments
+            s0 = 0.0
+            s1 = 0.0
+            s2 = 0.0
+            s3 = 0.0
+            s4 = 0.0
+            t0 = 0.0  # X' W y
+            t1 = 0.0
+            t2 = 0.0
+            n_valid = 0
+            for j in range(lo, hi + 1):
+                if not np.isfinite(beta_raw[j]):
+                    continue
+                t = positions[j] - x_i
+                u = t / h_i
+                if u < 0.0:
+                    u = -u
+                if u >= 1.0:
+                    continue
+                tri = 1.0 - u * u * u
+                tri = tri * tri * tri
+                w = tri * coverage[j]
+                if w <= 0.0:
+                    continue
+                y = beta_raw[j]
+                t2_loc = t * t
+                s0 += w
+                s1 += w * t
+                s2 += w * t2_loc
+                s3 += w * t2_loc * t
+                s4 += w * t2_loc * t2_loc
+                t0 += w * y
+                t1 += w * t * y
+                t2 += w * t2_loc * y
+                n_valid += 1
+
+            if n_valid < min_cpgs_for_smooth or s0 <= 0.0:
+                out[i] = beta_raw[i]
+                continue
+
+            # ---- 4. Solve WLS for the intercept only (we don't need slope/curvature)
+            if degree == 2:
+                det = s0 * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s3 * s2) + s2 * (s1 * s3 - s2 * s2)
+                if det == 0.0 or not np.isfinite(det):
+                    out[i] = t0 / s0  # singular -> weighted mean fallback
+                    continue
+                num = t0 * (s2 * s4 - s3 * s3) - s1 * (t1 * s4 - s3 * t2) + s2 * (t1 * s3 - s2 * t2)
+                intercept = num / det
+            else:  # degree == 1
+                det = s0 * s2 - s1 * s1
+                if det == 0.0 or not np.isfinite(det):
+                    out[i] = t0 / s0
+                    continue
+                intercept = (t0 * s2 - s1 * t1) / det
+
+            if intercept < 0.0:
+                intercept = 0.0
+            elif intercept > 1.0:
+                intercept = 1.0
+            out[i] = intercept
+
+        return out
+
+    if njit is not None:
+        _BSMOOTH_NJIT_FN = njit(cache=True)(_bsmooth_one_chrom)
+    else:
+        _BSMOOTH_NJIT_FN = _bsmooth_one_chrom
+    return _BSMOOTH_NJIT_FN
+
+
+def smooth_methylation_bsmooth(
+    methylstore_path: str,
+    samples: list[str],
+    *,
+    ns: int = 70,
+    h_bp: int = 1000,
+    degree: int = 2,
+    min_cpgs_for_smooth: int = 3,
+    output_path: str | None = None,
+) -> pl.DataFrame | None:
+    """BSmooth-style local-polynomial smoother (Hansen et al. 2012).
+
+    For each CpG, fits a local weighted-polynomial regression on the
+    neighboring CpGs:
+
+      * **Adaptive bandwidth**: ``h_i = max(distance to ns-th nearest CpG, h_bp)``.
+        Sparse regions widen to capture ``ns`` CpGs; dense regions are
+        capped below by ``h_bp`` so the kernel never collapses to
+        immediate neighbors.
+      * **Tricube distance weights x coverage**:
+        ``w_j = (1 - (|x_j - x_i| / h_i)^3)^3 * N_j``.
+      * **Polynomial degree** (``1`` or ``2``; default ``2`` matches BSmooth).
+        Quadratic captures local curvature; linear is a faster fallback.
+      * Smoothed value = polynomial intercept at the focal CpG, clipped
+        to ``[0, 1]``.
+
+    See :func:`smooth_methylation_gaussian` for the faster Gaussian-
+    kernel approximation that previously occupied this slot.
+
+    Performance: the per-site fit is compiled via ``numba.njit`` (numba
+    is already an epykit core dep). First call incurs a one-time
+    compilation latency (~1 s); subsequent calls run at native speed.
+
+    Parameters
+    ----------
+    methylstore_path
+        Path to the partitioned methylstore.
+    samples
+        Sample ids to smooth.
+    ns
+        Target number of CpGs per local window (BSmooth default 70).
+    h_bp
+        Minimum half-window in base pairs (BSmooth default 1000).
+    degree
+        Local-polynomial degree, ``1`` or ``2``. Default ``2``.
+    min_cpgs_for_smooth
+        Fall back to raw beta if fewer than this many valid neighbors
+        contribute weight (default 3).
+    output_path
+        When set, write a sidecar parquet store at this root and return
+        ``None``; otherwise concatenate everything and return a frame.
+
+    Returns
+    -------
+    pl.DataFrame or None
+        Long-form frame (chrom, pos, sample, beta_raw, beta_smooth) when
+        ``output_path`` is ``None``, otherwise ``None`` after sidecar write.
+    """
+    if degree not in (1, 2):
+        raise ValueError(f"degree must be 1 or 2; got {degree}")
+    if ns < 2:
+        raise ValueError(f"ns must be >= 2; got {ns}")
+    if h_bp <= 0:
+        raise ValueError(f"h_bp must be > 0; got {h_bp}")
+
+    smoother = _bsmooth_make_njit()
+
+    store = Path(methylstore_path)
+    records: list[pl.DataFrame] = []
+    out_root = Path(output_path) if output_path else None
+    if out_root:
+        out_root.mkdir(parents=True, exist_ok=True)
+
+    for sample in samples:
+        sample_dir = store / f"sample={sample}"
+        if not sample_dir.exists():
+            logger.warning("Sample '%s' not found in %s; skipping", sample, store)
+            continue
+
+        for chrom_dir in sorted(sample_dir.glob("chrom=*")):
+            chrom = chrom_dir.name.removeprefix("chrom=")
+            parts = list(chrom_dir.glob("part-*.parquet"))
+            if not parts:
+                continue
+
+            df = pl.concat(
+                [pl.read_parquet(str(p), columns=["pos", "N_meth", "coverage"]) for p in parts]
+            ).sort("pos")
+            n = df.height
+            if n == 0:
+                continue
+
+            pos = df["pos"].to_numpy().astype(np.float64)
+            meth = df["N_meth"].to_numpy().astype(np.float64)
+            cov = df["coverage"].to_numpy().astype(np.float64)
+
+            beta_raw = np.where(cov > 0, meth / np.maximum(cov, 1.0), np.nan)
+            if n < min_cpgs_for_smooth:
+                logger.debug(
+                    "  %s / %s: only %d sites; skipping bsmooth",
+                    sample,
+                    chrom,
+                    n,
+                )
+                beta_smooth = beta_raw.copy()
+            else:
+                beta_smooth = smoother(
+                    pos,
+                    meth,
+                    cov,
+                    int(ns),
+                    float(h_bp),
+                    int(degree),
+                    int(min_cpgs_for_smooth),
+                )
+
+            chunk = pl.DataFrame(
+                {
+                    "chrom": pl.Series([chrom] * n, dtype=pl.Utf8),
+                    "pos": df["pos"],
+                    "sample": pl.Series([sample] * n, dtype=pl.Utf8),
+                    "beta_raw": pl.Series(beta_raw.astype(np.float32)),
+                    "beta_smooth": pl.Series(beta_smooth.astype(np.float32)),
+                }
+            )
+
+            if out_root is not None:
+                part_dir = out_root / f"sample={sample}" / f"chrom={chrom}"
+                part_dir.mkdir(parents=True, exist_ok=True)
+                chunk.write_parquet(
+                    str(part_dir / "part-0.parquet"),
+                    compression="zstd",
+                )
+            else:
+                records.append(chunk)
+
+    if out_root is not None:
+        return None
+
+    if not records:
+        return pl.DataFrame(schema=_SMOOTH_EMPTY_SCHEMA)
+    return pl.concat(records)
+
+
+# Public API -- fast Gaussian smoothing (replaces statsmodels LOESS)
+
+
+def smooth_methylation_gaussian(
+    methylstore_path: str,
+    samples: list[str],
+    bandwidth: int = 1000,
+    grid_resolution_bp: int | None = None,
+    output_path: str | None = None,
+) -> pl.DataFrame | None:
+    """Smooth per-sample beta values with a fast Gaussian kernel.
+
+    .. note::
+       This is a Gaussian-kernel approximation, not the local-LOESS smoother
+       used in Hansen et al.'s BSmooth. A true LOESS-based smoother is on
+       the roadmap.
+
+    Within each chromosome and sample, raw beta values are smoothed along
+    the genomic axis. The implementation projects raw betas onto a regular
+    grid, applies a coverage-weighted Gaussian filter
+    (``scipy.ndimage.gaussian_filter1d``), then interpolates back to the
+    original CpG positions. This is O(G) where G is the grid size,
+    versus O(n^2) for LOESS -- typically 100-500x faster on WGBS-scale data.
+    """
+    try:
+        from scipy.ndimage import gaussian_filter1d
+    except ImportError as exc:
+        raise ImportError(
+            "scipy is required for Gaussian smoothing. Install with: pip install scipy"
+        ) from exc
+
+    store = Path(methylstore_path)
+    records: list[pl.DataFrame] = []
+
+    # Determine grid resolution once (same for all samples/chroms)
+    _grid_res = max(1, bandwidth // 20) if grid_resolution_bp is None else grid_resolution_bp
+    _out_root = Path(output_path) if output_path else None
+    if _out_root:
+        _out_root.mkdir(parents=True, exist_ok=True)
+
+    for sample in samples:
+        sample_dir = store / f"sample={sample}"
+        if not sample_dir.exists():
+            logger.warning("Sample '%s' not found in %s; skipping", sample, store)
+            continue
+
+        for chrom_dir in sorted(sample_dir.glob("chrom=*")):
+            chrom = chrom_dir.name.removeprefix("chrom=")
+            parts = list(chrom_dir.glob("part-*.parquet"))
+            if not parts:
+                continue
+
+            df = pl.concat(
+                [pl.read_parquet(str(p), columns=["pos", "N_meth", "coverage"]) for p in parts]
+            ).sort("pos")
+
+            pos = df["pos"].to_numpy().astype(np.float64)
+            meth = df["N_meth"].to_numpy().astype(np.float64)
+            cov = df["coverage"].to_numpy().astype(np.float64)
+
+            with np.errstate(invalid="ignore", divide="ignore"):
+                beta_raw = np.where(cov > 0, meth / cov, np.nan).astype(np.float32)
+
+            beta_smooth = beta_raw.copy()
+            valid = ~np.isnan(beta_raw)
+            n_valid = int(valid.sum())
+
+            if n_valid >= 4:
+                pos_valid = pos[valid]
+                beta_valid = beta_raw[valid].astype(np.float64)
+
+                # Build a regular grid spanning the valid positions.
+                grid_start = int(pos_valid[0])
+                grid_end = int(pos_valid[-1]) + _grid_res
+                grid_pos = np.arange(grid_start, grid_end, _grid_res, dtype=np.float64)
+
+                # Coverage-weighted interpolation onto the regular grid
+                cov_valid = cov[valid].astype(np.float64)
+                grid_beta = np.interp(grid_pos, pos_valid, beta_valid)
+                grid_weights = np.interp(grid_pos, pos_valid, cov_valid)
+                grid_weights = np.maximum(grid_weights, 0.1)  # avoid exact zeros
+
+                # Apply weighted Gaussian: smooth numerator and denominator separately
+                sigma_grid = max(bandwidth / _grid_res, 0.5)
+                grid_num = gaussian_filter1d(
+                    grid_beta * grid_weights, sigma=sigma_grid, mode="nearest"
+                )
+                grid_den = gaussian_filter1d(grid_weights, sigma=sigma_grid, mode="nearest")
+                smoothed_grid = grid_num / np.maximum(grid_den, 1e-9)
+                np.clip(smoothed_grid, 0.0, 1.0, out=smoothed_grid)
+
+                # Interpolate smoothed values back to original CpG positions
+                smoothed_at_cpgs = np.interp(pos_valid, grid_pos, smoothed_grid)
+                beta_smooth[valid] = smoothed_at_cpgs.astype(np.float32)
+            else:
+                logger.debug(
+                    "  %s / %s: only %d valid sites; skipping smoothing",
+                    sample,
+                    chrom,
+                    n_valid,
+                )
+
+            chunk = pl.DataFrame(
+                {
+                    "chrom": pl.Series([chrom] * len(df), dtype=pl.Utf8),
+                    "pos": df["pos"],
+                    "sample": pl.Series([sample] * len(df), dtype=pl.Utf8),
+                    "beta_raw": pl.Series(beta_raw),
+                    "beta_smooth": pl.Series(beta_smooth),
+                }
+            )
+
+            if _out_root is not None:
+                part_dir = _out_root / f"sample={sample}" / f"chrom={chrom}"
+                part_dir.mkdir(parents=True, exist_ok=True)
+                chunk.write_parquet(str(part_dir / "part-0.parquet"), compression="zstd")
+            else:
+                records.append(chunk)
+
+    if _out_root is not None:
+        return None
+
+    if not records:
+        return pl.DataFrame(schema=_SMOOTH_EMPTY_SCHEMA)
+
+    return pl.concat(records).sort(["chrom", "pos", "sample"])
