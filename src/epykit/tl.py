@@ -1,0 +1,1839 @@
+"""High-level orchestrators for the standard WGBS analysis flow.
+
+Public entry points: ``qc``, ``dmc``, ``dmr``, ``annotate``,
+``diagnose_dmr_calling``. Each mutates a ``MethylData`` in place (except
+``diagnose_dmr_calling`` which returns a dict) -- results land in
+``md.obs`` / ``md.varm`` / ``md.uns``. See the module docstrings of
+``dmc.py`` and ``dmr.py`` for the underlying engines.
+"""
+
+from __future__ import annotations
+
+import gc
+import logging
+from typing import Any, Literal
+
+import polars as pl
+
+from ._dmc_config import DMCConfig
+from ._dmc_stages import (
+    DMCOutcome,
+    finish,
+    lookup_resume,
+    open_input_store,
+    persist_resume,
+    plan_run,
+    post_process,
+    publish,
+    run_contrast,
+    run_engine,
+)
+from .annotate import _GTF_CACHE, annotate_cpg_islands, annotate_features
+from .dmr import (
+    _DMR_DEFAULT_MIN_CPGS,
+    DMR_PRESETS,  # noqa: F401 -- public re-export: `from epykit.tl import DMR_PRESETS`
+    _resolve_tile_chromosomes,
+    apply_region_qfilter,
+    call_dmr_chain_merge,
+    call_dmr_sliding_window,
+    call_dmr_tile_based,
+    empirical_fdr_for_chain_merge,
+    empirical_fdr_for_dmr,
+    resolve_layer_min_cpgs,
+)
+from .methyldata import MethylData
+from .qc import bisulfite_conversion_rate, coverage_uniformity, global_methylation_report
+
+logger = logging.getLogger(__name__)
+
+
+def _auto_test(
+    md: MethylData,
+    design: str | None = None,
+    covariates: list[str] | None = None,
+    allow_n1: bool = False,
+) -> str:
+    """Auto-dispatcher: post-0.7.5 surface is closed to {fisher, lr}.
+    fisher at n=1 (only engine that works), lr at n>=2.
+
+    When a covariate design is supplied, we MUST use the binomial GLM path
+    (``"glm"``) because the closed-form ``lr`` path doesn't admit
+    covariates. The choice is therefore unconditional whenever the user
+    asks for adjustment.
+
+    ``allow_n1`` is forwarded to :func:`_auto_test_simple` and only takes
+    effect when there are fewer than 2 replicates per group.
+    """
+    if design is not None or (covariates is not None and len(covariates) > 0):
+        return "glm"
+    return _auto_test_simple(md, allow_n1=allow_n1)
+
+
+# One-shot warning gate: ``tl.dmc`` emits a UserWarning the first time a
+# user explicitly selects ``test="fisher"`` in a session. We don't want to
+# spam them across thousands of chromosomes/sites -- once is enough.
+_FISHER_WARNED = False
+_DMR_FDR_NOTED = False
+
+
+def _note_dmr_fdr_calibration_once() -> None:
+    """One-shot note that asymptotic DMR q-values are not a calibrated FDR.
+
+    Chain-merge uses BY over its complete interval search; other callers
+    retain their own corrections. These adjustments do not repair invalid
+    raw interval p-values caused by site miscalibration or CpG correlation.
+    Emitted at INFO (not a warning) so it informs interactive users
+    without polluting stderr. Fired on every ``tl.dmr`` call (M2): the
+    caveat applies to the asymptotic ``combined_qvalue`` even when an
+    empirical-FDR run is overlaid on top, and was previously hidden from
+    users running ``empirical_fdr=True`` who still reported the asymptotic
+    q-values upstream.
+    """
+    global _DMR_FDR_NOTED
+    if _DMR_FDR_NOTED:
+        return
+    _DMR_FDR_NOTED = True
+    logger.info(
+        "DMR scores use asymptotic per-CpG combinations. chain_merge applies "
+        "BY over the complete interval search; other callers retain their "
+        "own corrections. CpG miscalibration or within-region correlation "
+        "can invalidate nominal region significance; empirical validation "
+        "is required before interpreting these scores as calibrated FDR."
+    )
+
+
+def _warn_fisher_once(stacklevel: int = 3) -> None:
+    """Emit a one-shot UserWarning when the user explicitly picks fisher.
+
+    ``stacklevel`` is the frame the warning points at: 3 reaches the caller
+    of a public ``tl`` function that calls this helper directly; a DMC
+    stage passes 4 because it sits one frame below ``tl.dmc``.
+    """
+    global _FISHER_WARNED
+    if _FISHER_WARNED:
+        return
+    _FISHER_WARNED = True
+    import warnings
+
+    warnings.warn(
+        "test='fisher' ignores between-replicate variance; p-values are "
+        "anti-conservative. Prefer test='lr' at n >= 2.",
+        UserWarning,
+        stacklevel=stacklevel,
+    )
+
+
+def _check_n1_and_union_footgun(
+    md: MethylData,
+    allow_n1: bool,
+    min_samples_treatment: int,
+    min_samples_control: int,
+    unit: str = "sites",
+    stacklevel: int = 3,
+) -> None:
+    """Enforce n>=2 per group (unless allow_n1) and warn on union+0/0.
+
+    ``stacklevel`` as in :func:`_warn_fisher_once`: 3 from a public ``tl``
+    function, 4 from a DMC stage.
+    """
+    if min(len(md.treatment_ids), len(md.control_ids)) < 2 and not allow_n1:
+        _auto_test_simple(md, allow_n1=False)  # raises ValueError
+    unite_info = md.uns.get("unite")
+    if (
+        unite_info is not None
+        and unite_info.get("type") == "union"
+        and min_samples_treatment == 0
+        and min_samples_control == 0
+    ):
+        import warnings
+
+        warnings.warn(
+            f"unite='union' with min_samples_treatment=min_samples_control=0 "
+            f"will test {unit} covered in only one sample per group. "
+            f"Recommended: both >= 2 (or unite='intersect').",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
+
+
+def _auto_test_simple(md: MethylData, allow_n1: bool = False, stacklevel: int = 3) -> str:
+    """Pick a sensible test based on group size.
+
+    Current default at n>=2: ``"lr"`` -- the quasi-binomial likelihood-ratio
+    chi-square with per-site McCullagh-Nelder dispersion. Closed-form on
+    the streaming (S0_g, S1_g, Sigmam^2/n_g) accumulators we already keep for
+    the score test. LR is closer to nominal type-I error than the score
+    test at the small samples (n=6) and boundary proportions typical in
+    WGBS.
+
+    The default returned here MUST match the CLI ``--test`` default (lr) and
+    the ``--test`` default for ``dmr`` (lr). See cli.py for the single source
+    of truth.
+
+    At n=1 (single replicate per group) there is no between-replicate
+    variability for phi to estimate. By default this is treated as a hard error
+    (statistical inference is not credible). Pass ``allow_n1=True`` to opt
+    into the Fisher exact fallback (anti-conservative; warns at runtime).
+    ``stacklevel`` is the frame that warning points at, as in
+    :func:`_warn_fisher_once`.
+    """
+    min_group = min(len(md.treatment_ids), len(md.control_ids))
+    if min_group < 2:
+        if not allow_n1:
+            raise ValueError(
+                f"At least 2 replicates per group are required for valid "
+                f"statistical inference (got treatment={len(md.treatment_ids)}, "
+                f"control={len(md.control_ids)}). To proceed anyway with "
+                f"Fisher exact on pooled reads (no between-replicate variance), "
+                f"pass allow_n1=True to ep.tl.dmc(). Be aware p-values from "
+                f"this path are anti-conservative and should not be reported "
+                f"as evidence of differential methylation."
+            )
+        import warnings
+
+        warnings.warn(
+            "n<2 per group: falling back to Fisher exact on pooled reads. "
+            "Between-replicate variance is ignored and p-values are anti-conservative.",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
+        return "fisher"
+    return "lr"
+
+
+def _resolve_tsv_output(
+    tsv: str | None,
+    csv: str | None,
+    *,
+    tsv_full: bool = False,
+    csv_full: bool = False,
+    tsv_alpha: float = 0.05,
+    csv_alpha: float = 0.05,
+) -> tuple[str | None, bool, float]:
+    """Resolve the ``tsv*`` output kwargs, honouring the deprecated ``csv*`` aliases.
+
+    ``csv`` / ``csv_full`` / ``csv_alpha`` are deprecated aliases for ``tsv`` /
+    ``tsv_full`` / ``tsv_alpha``. epykit writes tab-delimited TSV by default
+    (pass a path ending in ``.csv`` for comma output), so the ``csv*`` names
+    were misleading. Passing any ``csv*`` value emits a ``DeprecationWarning``
+    and is treated as the matching ``tsv*`` value -- the new ``tsv*`` name wins
+    if both are given. Returns ``(path, full, alpha)``.
+    """
+    if csv is not None or csv_full or csv_alpha != 0.05:
+        import warnings
+
+        warnings.warn(
+            "The `csv` / `csv_full` / `csv_alpha` arguments are deprecated "
+            "aliases for `tsv` / `tsv_full` / `tsv_alpha` and will be removed in "
+            "a future release. epykit writes tab-delimited TSV by default; pass "
+            "a path ending in `.csv` for comma-separated output.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+    path = tsv if tsv is not None else csv
+    full = tsv_full or csv_full
+    alpha = tsv_alpha if tsv_alpha != 0.05 else csv_alpha
+    return path, full, alpha
+
+
+def _resolve_auto_tsv(
+    md: MethylData,
+    tsv,
+    csv,
+    *,
+    default_name: str,
+    tsv_full: bool = False,
+    csv_full: bool = False,
+    tsv_alpha: float = 0.05,
+    csv_alpha: float = 0.05,
+    stacklevel: int = 3,
+) -> tuple[str | None, bool, float, bool]:
+    """Resolve TSV output for the **auto-emit** analyses (dmc / dmr / annotate).
+
+    Unlike :func:`_resolve_tsv_output` (opt-in), these write a human-readable
+    table by default: with no explicit path the table is auto-emitted to
+    ``<md.analysis_root>/results/<default_name>`` -- the same place ``md.save``
+    writes. ``tsv`` semantics:
+
+    * ``None`` / ``True`` -> auto-emit (the default)
+    * ``False``           -> don't write
+    * ``"path.tsv"``      -> write there (``.csv`` suffix -> comma-delimited)
+
+    ``csv`` / ``csv_full`` / ``csv_alpha`` are deprecated aliases (warn).
+    Auto-emit is globally suppressed by ``EPYKIT_NO_AUTO_TSV`` and skipped
+    silently when there is no ``analysis_root`` to anchor on (e.g. an in-memory
+    MethylData built without ``store_dir``).
+
+    Returns ``(path_or_None, full, alpha, is_auto)``. ``is_auto`` is True only
+    when the path was auto-derived, so the caller can make the auto write
+    best-effort while letting an explicit path surface errors. ``stacklevel``
+    is the frame the alias warning points at, as in :func:`_warn_fisher_once`.
+    """
+    if csv is not None or csv_full or csv_alpha != 0.05:
+        import warnings
+
+        warnings.warn(
+            "The `csv` / `csv_full` / `csv_alpha` arguments are deprecated "
+            "aliases for `tsv` / `tsv_full` / `tsv_alpha` and will be removed "
+            "in a future release. epykit writes tab-delimited TSV by default; "
+            "pass a path ending in `.csv` for comma-separated output.",
+            DeprecationWarning,
+            stacklevel=stacklevel,
+        )
+    full = tsv_full or csv_full
+    alpha = tsv_alpha if tsv_alpha != 0.05 else csv_alpha
+
+    explicit = tsv if isinstance(tsv, str) else (csv if isinstance(csv, str) else None)
+    if explicit is not None:
+        return explicit, full, alpha, False
+    if tsv is False:
+        return None, full, alpha, False
+
+    import os
+
+    if os.environ.get("EPYKIT_NO_AUTO_TSV") in ("1", "true", "True"):
+        return None, full, alpha, False
+    root = getattr(md, "analysis_root", None)
+    if not root:
+        return None, full, alpha, False
+    from pathlib import Path
+
+    return str(Path(root) / "results" / default_name), full, alpha, True
+
+
+def _emit_result_tsv(write_fn, path: str, *, is_auto: bool) -> None:
+    """Run an export writer, swallowing failures only for the auto-emit path.
+
+    An explicit ``tsv=`` path surfaces errors (the user asked for the file); an
+    auto-emitted default is best-effort, so a write hiccup never aborts the
+    analysis -- the results are already on ``md`` regardless.
+    """
+    try:
+        write_fn()
+    except Exception as exc:  # auto-emit must not break the run
+        if not is_auto:
+            raise
+        logger.warning("Auto TSV emit to %s skipped: %s", path, exc)
+
+
+def qc(
+    md: MethylData,
+    chh_context_store: str | None = None,
+    *,
+    run_sex_check: bool = False,
+    run_contamination: bool = False,
+    run_sample_correlation: bool = False,
+    correlation_method: str = "spearman",
+    expected_sex_col: str | None = None,
+    tsv: str | None = None,
+    csv: str | None = None,  # deprecated alias for tsv (epykit writes TSV)
+) -> None:
+    """Populate md.obs with per-sample QC metrics and cache QC tables in md.uns.
+
+    additions are opt-in via the ``run_*`` flags so the default
+    ``tl.qc(md)`` keeps the existing fast subset.
+    """
+    samples = md.obs.get_column("sample_id").to_list()
+
+    global_report = global_methylation_report(md.store, samples)
+    cov_reports = [coverage_uniformity(md.store, sample) for sample in samples]
+    cov_report = pl.concat(cov_reports) if cov_reports else pl.DataFrame()
+
+    obs = md.obs
+    cpG_report = global_report.filter(pl.col("context") == "CpG")
+    if len(cpG_report) > 0:
+        obs = obs.join(
+            cpG_report.select([pl.col("sample").alias("sample_id"), "global_methylation"]),
+            on="sample_id",
+            how="left",
+        )
+
+    if len(cov_report) > 0:
+        cov_genome = cov_report.filter(pl.col("chrom") == "genome")
+        obs = obs.join(
+            cov_genome.select(
+                [
+                    "sample",
+                    "mean_coverage",
+                    "frac_ge_1x",
+                    "frac_ge_5x",
+                    "frac_ge_10x",
+                    "low_coverage_flag",
+                ]
+            ).rename({"sample": "sample_id"}),
+            on="sample_id",
+            how="left",
+        )
+
+    if chh_context_store:
+        conv = []
+        for sample in samples:
+            try:
+                rate = bisulfite_conversion_rate(md.store, sample, chh_context_store)
+            except Exception as exc:
+                logger.warning(
+                    "Bisulfite conversion rate unavailable for sample %s (CHH store %s): %s",
+                    sample,
+                    chh_context_store,
+                    exc,
+                )
+                rate = None
+            conv.append({"sample_id": sample, "bisulfite_conversion_rate": rate})
+        obs = obs.join(pl.DataFrame(conv), on="sample_id", how="left")
+
+    # --- clinical QC additions ----------------------------------
+    if run_sex_check:
+        from .qc import sex_check as _sex_check
+
+        expected = None
+        if expected_sex_col and expected_sex_col in obs.columns:
+            expected = {
+                row["sample_id"]: row[expected_sex_col]
+                for row in obs.iter_rows(named=True)
+                if row.get(expected_sex_col) is not None
+            }
+        sex_df = _sex_check(md.store, samples, expected_sex=expected)
+        md.uns["qc_sex_check"] = sex_df
+        obs = obs.join(
+            sex_df.select(["sample_id", "inferred_sex", "mismatch"]).rename(
+                {"mismatch": "sex_mismatch"}
+            ),
+            on="sample_id",
+            how="left",
+        )
+
+    if run_contamination:
+        from .qc import contamination_estimate as _contam
+
+        scores = [
+            {"sample_id": s, "contamination_score": float(_contam(md.store, s))} for s in samples
+        ]
+        obs = obs.join(pl.DataFrame(scores), on="sample_id", how="left")
+
+    if run_sample_correlation:
+        from .qc import sample_correlation as _samp_corr
+
+        corr_df = _samp_corr(md.store, samples, method=correlation_method)
+        md.uns["qc_sample_correlation"] = corr_df
+        if len(corr_df) > 0:
+            # Per-sample min off-diagonal correlation (low -> likely swap).
+            off_diag = corr_df.filter(pl.col("sample_a") != pl.col("sample_b"))
+            min_corr = (
+                off_diag.group_by("sample_a")
+                .agg(pl.min("correlation").alias("min_pairwise_corr"))
+                .rename({"sample_a": "sample_id"})
+            )
+            obs = obs.join(min_corr, on="sample_id", how="left")
+
+    md.obs = obs
+    md.uns["qc_global_methylation"] = global_report
+    md.uns["qc_coverage_uniformity"] = cov_report
+
+    tsv, _, _ = _resolve_tsv_output(tsv, csv)
+    if tsv is not None:
+        from .export import qc_to_tsv
+
+        qc_to_tsv(md, tsv)
+
+
+def dmc(
+    md: MethylData,
+    test: str = "auto",
+    chromosomes: list[str] | None = None,
+    min_samples_treatment: int | None = None,
+    min_samples_control: int = 0,
+    dispersion: str = "eb",
+    reference: str = "adaptive",
+    allow_n1: bool = False,
+    # Section 1 of multi-group / continuous-covariate contrasts
+    formula: str | None = None,
+    contrast=None,
+    covariates: list[str] | None = None,
+    treatment_col: str = "treatment",
+    # permutation-based empirical FDR (binary path only) ----------
+    empirical_fdr: bool = False,
+    n_perm: int = 100,
+    perm_seed: int = 42,
+    perm_n_jobs: int = 1,
+    *,
+    backend: str = "sequential",
+    n_workers: int | None = None,
+    glm_backend: str = "cpu",
+    resumable: bool = False,
+    # Memory contract (since 1.0.1): materialize=True assembles the full
+    # per-CpG result onto md.varm (the historical behaviour, ~700 MB at
+    # 22M CpGs); materialize=False keeps only the streaming DMCStore handle
+    # so peak memory stays O(largest chromosome) end-to-end.
+    materialize: bool = True,
+    use_smoothed: bool = False,
+    smoothing: bool = False,
+    smoothing_span_bp: int = 500,
+    # Opt-in canonical chromosome filter (since 1.2) ----------------------
+    canonical_only: bool = False,
+    # FDR procedure (since 0.7.1) ----------------------------------------
+    fdr_method: str = "fdr_bh",
+    # Neighbour-aware p-value combining (since 0.7.1) --------------------
+    neighbour_combine: bool = False,
+    neighbour_bp: int = 500,
+    # Separation-aware Fisher fallback (since 0.7.1) ---------------------
+    sep_fallback: bool = False,
+    sep_threshold: float = 0.9,
+    # Explicit patsy reference level for categorical factors (since 0.7.5) -
+    reference_level: str | None = None,
+    # TSV output (since 1.0). Auto-emits significant DMCs to
+    # <analysis_root>/results/dmc.significant.tsv by default; tsv=False disables,
+    # tsv="path" overrides. csv* are deprecated aliases (epykit writes TSV).
+    tsv: str | bool | None = None,
+    tsv_full: bool = False,
+    tsv_alpha: float = 0.05,
+    csv: str | None = None,
+    csv_full: bool = False,
+    csv_alpha: float = 0.05,
+) -> None:
+    """Run DMC calling and store result in md.varm['dmc_<test>'].
+
+    Smoothed-input mode (``use_smoothed=True``)
+    -------------------------------------------
+    Requires that ``ep.pp.smooth(md)`` has been run first (either method,
+    ``"gaussian"`` or ``"bsmooth"``). The DMC test then runs on
+    pseudo-counts derived from the smoothed beta values:
+
+      ``N_meth' = round(beta_smooth * coverage)``,
+      ``N_unmeth' = coverage - N_meth'``
+
+    rather than the raw per-CpG counts. All 8 test backends work
+    unchanged. Results land in ``md.varm["dmc_<test>_smoothed"]`` so the
+    smoothed and raw runs don't collide in the same session.
+
+    .. warning::
+       This is **not** equivalent to DSS's ``DMLfit.multiFactor(smoothing=TRUE)``.
+       DSS uses BSmooth-smoothed estimates only in the per-CpG **dispersion**
+       step; the per-CpG GLM still fits raw counts. The pseudo-count
+       approach here is more aggressive -- it replaces the count signal
+       entirely with the locally-averaged version, which can wash out
+       genuine per-CpG signal at default BSmooth parameters (ns=70,
+       h_bp=1000). For replicating DSS-style analyses, prefer
+       ``use_smoothed=False`` (the default) with ``test="lr"`` -- the
+       quasi-binomial LR with McCullagh-Nelder dispersion is the closest
+       per-CpG match to DSS's count model in epykit. Reach for
+       ``use_smoothed=True`` only when you genuinely want a strongly
+       regularised local-mean test, with loosened smoother parameters
+       (e.g. ``ns=20``).
+
+    Backend selection
+    -----------------
+    ``backend="sequential"`` (default) walks chromosomes one at a time on
+    the calling process -- bit-identical to the pre-0.4 behaviour.
+    ``backend="dask"`` and ``backend="ray"`` submit one task per
+    chromosome to a worker pool; both require the corresponding optional
+    extra (``pip install 'epykit[distributed]'`` for Dask, ``epykit[ray]``
+    for Ray). ``n_workers`` controls the pool size; ``None`` lets the
+    backend pick a default.
+
+    ``glm_backend="cpu"`` (default) runs the batched IRLS used by
+    ``test="glm"`` / formula contrasts on the CPU via numpy. Setting
+    ``glm_backend="gpu"`` routes the IRLS through CuPy (requires
+    ``pip install 'epykit[gpu]'``) -- only affects the GLM hot path; the
+    closed-form ``lr`` / ``score`` tests stay CPU-only.
+
+    ``resumable=True`` (default False) participates in the 0.4.0
+    pipeline manifest: when an earlier ``tl.dmc`` call with the same
+    inputs + params is recorded in ``<store>/.epykit_manifest.json``,
+    the prior result is loaded from its sidecar parquet and the
+    computation is skipped. Inputs include the methylstore fingerprint,
+    treatment / control sample lists, ``test``, ``formula``,
+    ``contrast``, ``covariates``, ``min_samples_*``, ``dispersion``,
+    ``reference``. Set False (the default) to preserve pre-0.4
+    behaviour -- no manifest read, no skip, no sidecar write.
+
+    Memory contract (``materialize``)
+    ---------------------------------
+    DMC *computation* is O(largest chromosome): the engine streams
+    chromosome-by-chromosome and BH correction rewrites per-chrom parquet
+    in place. ``materialize=True`` (the default) then assembles the full
+    per-CpG table onto ``md.varm`` for plotting / report / export (a
+    whole-genome operation; ~700 MB at 22M CpGs). Pass
+    ``materialize=False`` to keep peak memory at O(largest chromosome)
+    end-to-end: the result lives only as the on-disk ``DMCStore`` (reachable
+    via ``md.dmc_store`` and streamed by ``tl.dmr``); ``md.dmc`` then
+    materialises on demand when accessed. ``materialize=False`` is
+    incompatible with the eager-only post-processors ``neighbour_combine``,
+    ``empirical_fdr`` and ``use_smoothed`` (they raise ``ValueError``), and
+    suppresses TSV auto-export.
+
+    Parameters
+    ----------
+    md : MethylData
+        Analysis object containing the methylstore path and the
+        treatment/control sample lists.
+    test : str
+        One of ``"auto"``, ``"lr"``, ``"welch_t"``, ``"fisher"``, or
+        ``"glm"``. ``"auto"`` resolves to ``"fisher"`` at n<2 and ``"lr"``
+        (the recommended default) at n>=2.
+
+        Engines removed in 0.7.5 (raise ``ValueError`` with a migration
+        hint): ``"logit_t"`` (use ``"welch_t"``), ``"bb_lr"`` (use
+        ``"lr"``), ``"score"`` (use ``"lr"``), ``"cmh"`` (use
+        ``formula='~ group + batch'``).
+
+        When ``formula`` and/or ``contrast`` are supplied, the test is
+        forced to a GLM-based path.
+    formula : str, optional
+        patsy formula on ``md.obs`` columns, e.g. ``"~ group"`` for a
+        multi-group test or ``"~ age + sex"`` for a continuous-covariate
+        primary effect. When supplied with ``contrast``, the engine fits
+        the GLM once per site and runs a Wald / joint-F test against the
+        contrast.
+    contrast : str or np.ndarray, optional
+        Contrast specification. Accepts:
+        - a column name in the resolved design (``"age"`` for a continuous
+          covariate primary effect; produces a single-coef Wald-z^2 test
+          with meth-scale CIs);
+        - a factor name (``"group"``); every dummy of that factor is
+          included -> joint F-test (multi-group);
+        - a patsy linear-combination string
+          (``"group[T.KO] - group[T.WT]"``); produces a single-row contrast;
+        - a raw ``(k, p)`` matrix.
+    covariates : list[str], optional
+        Convenience list of column names to include as nuisance terms.
+        Combined with ``formula`` and the resolved ``treatment_col``.
+    treatment_col : str, default ``"treatment"``
+        Name of the binary 0/1 column in ``md.obs`` used by the legacy
+        binary path. Ignored when ``contrast`` is supplied and resolves
+        without it.
+    dispersion : {"site", "chrom", "shrink", "eb"}
+        McCullagh-Nelder dispersion strategy used by the ``"lr"`` test.
+        Default ``"eb"`` shrinks the per-site Pearson
+        residual estimate toward a chromosome-wide pool via empirical-Bayes
+        weights (stable at low n / low coverage). Alternatives:
+        ``"site"`` uses the noisy per-site estimate only; ``"chrom"`` uses
+        the chromosome-pooled phi for every site; ``"shrink"`` is a James-Stein-style weighted average of per-site and
+        chromosome estimates with a fixed pseudo-df weight. See
+        :func:`_score_finalize` in ``dmc.py`` for the math.
+    chromosomes : list[str], optional
+        Restrict to a subset of chromosomes. Auto-detected when None. An
+        explicit list, including an empty one, takes precedence over
+        ``canonical_only``.
+    canonical_only : bool, keyword-only
+        When ``chromosomes`` is None, keep only the fixed human-style
+        chromosome set (``1``-``22``, ``X``, ``Y``, ``M``/``MT``, with or
+        without ``chr``; see :mod:`epykit._chroms`) of the auto-detected
+        store partitions. The filter runs before the engine and before the
+        multiple-testing correction, on the binary and the formula /
+        contrast path alike, and the same resolved list is handed to every
+        ``empirical_fdr`` permutation. One INFO line names the dropped
+        contigs. Recorded in ``md.uns["dmc"]["canonical_only"]`` and part
+        of the ``resumable=True`` fingerprint. Default False keeps every
+        partition; the contigs the store holds are unchanged either way.
+    smoothing, smoothing_span_bp : bool, int
+        DSS-style per-sample count smoothing, an ``"lr"`` engine option:
+        each sample's raw counts are replaced by a uniform-box average over
+        the CpGs within ``+/-smoothing_span_bp // 2`` bp before the test.
+        Both are recorded in ``md.uns["dmc"]`` and part of the
+        ``resumable=True`` fingerprint (the span only while smoothing is
+        on). The other engines and the formula / contrast path do not read
+        them.
+    min_samples_treatment, min_samples_control : int
+        per-site minimum number of samples with non-zero coverage in
+        each group. Sites that fail are NaN'd out before FDR correction.
+        Primarily useful when ``ep.pp.unite(..., type="union")`` was used so
+        that union-introduced zero-coverage rows aren't treated as real
+        observations.
+
+    """
+    cfg = DMCConfig(
+        test=test,
+        chromosomes=chromosomes,
+        min_samples_treatment=min_samples_treatment,
+        min_samples_control=min_samples_control,
+        dispersion=dispersion,
+        reference=reference,
+        allow_n1=allow_n1,
+        formula=formula,
+        contrast=contrast,
+        covariates=covariates,
+        treatment_col=treatment_col,
+        empirical_fdr=empirical_fdr,
+        n_perm=n_perm,
+        perm_seed=perm_seed,
+        perm_n_jobs=perm_n_jobs,
+        backend=backend,
+        n_workers=n_workers,
+        glm_backend=glm_backend,
+        resumable=resumable,
+        materialize=materialize,
+        use_smoothed=use_smoothed,
+        smoothing=smoothing,
+        smoothing_span_bp=smoothing_span_bp,
+        canonical_only=canonical_only,
+        fdr_method=fdr_method,
+        neighbour_combine=neighbour_combine,
+        neighbour_bp=neighbour_bp,
+        sep_fallback=sep_fallback,
+        sep_threshold=sep_threshold,
+        reference_level=reference_level,
+        tsv=tsv,
+        tsv_full=tsv_full,
+        tsv_alpha=tsv_alpha,
+        csv=csv,
+        csv_full=csv_full,
+        csv_alpha=csv_alpha,
+    )
+
+    # The stages live in _dmc_stages; each hands a frozen record to the
+    # next. The three ways a result can arrive stay visible here: the
+    # formula / contrast run, the resumable=True cache hit and the ordinary
+    # binary run all end in publish (the only writer of md.uns["dmc"]) and
+    # finish (the transitional-column warning and the TSV export).
+    plan = plan_run(md, cfg)
+
+    if plan.mode == "contrast":
+        outcome = run_contrast(md, plan)
+        publish(md, plan, outcome)
+        finish(md, plan, outcome)
+        return
+
+    ticket = lookup_resume(md, plan)
+    if ticket is not None and ticket.hit is not None:
+        outcome = DMCOutcome(result=ticket.hit, store=None, resumed=True)
+        publish(md, plan, outcome)
+        finish(md, plan, outcome)
+        return
+
+    # post_process runs inside the with block because the permutation null
+    # re-reads the input store, which may be the smoothed temp store.
+    with open_input_store(md, plan) as store_path:
+        store = run_engine(md, plan, store_path)
+        result = post_process(md, plan, store, store_path)
+    outcome = DMCOutcome(result=result, store=store)
+
+    publish(md, plan, outcome)
+    if ticket is not None:
+        persist_resume(md, plan, ticket, outcome)
+    finish(md, plan, outcome)
+
+
+def _empirical_strata_map(md: MethylData, column: str | None) -> dict[str, list[str]] | None:
+    """Stratum label -> sample ids for within-stratum label shuffles.
+
+    ``None`` when no strata column was requested. A column that is missing
+    from ``md.obs`` or that leaves any treatment / control sample without a
+    label raises, so a typo can never fall back to an unrestricted shuffle.
+    """
+    if column is None:
+        return None
+    if column not in md.obs.columns:
+        raise ValueError(
+            f"empirical_strata={column!r} is not a column of md.obs "
+            f"(columns: {md.obs.columns}). Add the stratum column or omit "
+            f"empirical_strata."
+        )
+    all_samples = list(md.treatment_ids) + list(md.control_ids)
+    strata_map: dict[str, list[str]] = {}
+    unlabelled: list[str] = []
+    rows = md.obs.filter(pl.col("sample_id").is_in(all_samples))
+    for row in rows.iter_rows(named=True):
+        label = row[column]
+        if label is None:
+            unlabelled.append(row["sample_id"])
+            continue
+        strata_map.setdefault(label, []).append(row["sample_id"])
+    covered = {s for members in strata_map.values() for s in members}
+    unlabelled.extend(s for s in all_samples if s not in covered and s not in unlabelled)
+    if unlabelled:
+        raise ValueError(
+            f"empirical_strata={column!r} does not cover every treatment / "
+            f"control sample; unlabelled: {sorted(unlabelled)}."
+        )
+    return strata_map
+
+
+def _empirical_fdr_set_value(dmr_df: pl.DataFrame) -> float | None:
+    """The constant ``empirical_fdr_set`` column as a scalar, or ``None``.
+
+    NaN (``max_t`` mode, or an undefined region estimate) maps to ``None``
+    so ``md.uns["dmr_params"]`` stays JSON-clean on save.
+    """
+    if "empirical_fdr_set" not in dmr_df.columns or len(dmr_df) == 0:
+        return None
+    value = dmr_df.get_column("empirical_fdr_set")[0]
+    if value is None or value != value:
+        return None
+    return float(value)
+
+
+# ``md.uns["dmc"]`` keys the chain_merge permutation replays verbatim. The
+# smoothing span is only meaningful when smoothing is on and is handled
+# separately.
+_CHAIN_MERGE_REPLAY_KEYS = (
+    "unite",
+    "min_samples_treatment",
+    "min_samples_control",
+    "dispersion",
+    "reference",
+    "smoothing",
+    "sep_fallback",
+    "sep_threshold",
+)
+
+
+def _chain_merge_permutation_inputs(
+    md: MethylData,
+    dmc_input: object,
+    chromosomes: list[str] | None,
+) -> tuple[dict[str, Any], str, list[str]]:
+    """Validate that the observed DMC can be replayed under shuffled labels.
+
+    Returns ``(dmc_kwargs, dmc_fdr_method, observed_chromosomes)`` for
+    :func:`epykit.dmr.empirical_fdr_for_chain_merge`. Every rejection
+    happens here, before any permutation starts:
+
+    * the canonical ``md.uns["dmc"]`` record must exist and carry the engine
+      knobs (a DMC computed outside ``ep.tl.dmc`` has no record to replay);
+    * GLM, formula / contrast designs and ``use_smoothed=True`` cannot be
+      permuted by label shuffling (the pseudo-count store is temporary);
+    * an explicit ``chromosomes=`` restriction must equal the observed DMC
+      universe, otherwise the caller has to rerun ``ep.tl.dmc`` with it.
+
+    The chromosome universe comes from the observed ``DMCStore`` manifest
+    or from the distinct chromosomes of the materialized DMC table, never
+    from the surviving DMRs.
+    """
+    from ._dmc_store import DMCStore
+    from .dmr import CHAIN_MERGE_PERM_DMC_TESTS
+
+    meta = md.uns.get("dmc")
+    if not meta:
+        raise ValueError(
+            "chain_merge empirical_fdr replays the observed DMC from md.uns['dmc'], "
+            "which is missing. Run ep.tl.dmc(md) first."
+        )
+    test_used = meta.get("test_used")
+    if (
+        meta.get("formula") is not None
+        or meta.get("contrast") is not None
+        or meta.get("design_terms") is not None
+        or test_used not in CHAIN_MERGE_PERM_DMC_TESTS
+    ):
+        raise NotImplementedError(
+            f"chain_merge empirical_fdr supports the two-group DMC tests "
+            f"{sorted(CHAIN_MERGE_PERM_DMC_TESTS)}; the DMC on md used "
+            f"test={test_used!r}"
+            f"{' with a formula / contrast design' if meta.get('formula') else ''}. "
+            f"Label shuffling cannot permute a covariate design. Omit "
+            f"empirical_fdr or recompute the DMC with a two-group test."
+        )
+    if meta.get("use_smoothed"):
+        raise NotImplementedError(
+            "chain_merge empirical_fdr cannot replay a use_smoothed=True DMC: the "
+            "smoothed pseudo-count store is temporary. Recompute the DMC with "
+            "use_smoothed=False (smoothing=True is supported)."
+        )
+    missing = [k for k in (*_CHAIN_MERGE_REPLAY_KEYS, "fdr_method") if meta.get(k) is None]
+    if meta.get("smoothing") and meta.get("smoothing_span_bp") is None:
+        missing.append("smoothing_span_bp")
+    if missing:
+        raise ValueError(
+            f"md.uns['dmc'] lacks the engine knobs {missing} needed to replay "
+            f"the observed DMC under shuffled labels. Recompute with ep.tl.dmc(md)."
+        )
+
+    if isinstance(dmc_input, DMCStore):
+        observed_chroms = dmc_input.chroms()
+    elif isinstance(dmc_input, pl.DataFrame):
+        observed_chroms = (
+            dmc_input.get_column("chrom").cast(pl.Utf8).unique(maintain_order=True).to_list()
+        )
+    else:  # pragma: no cover - tl.dmr only hands over these two types
+        raise TypeError(f"Unsupported DMC input {type(dmc_input).__name__}")
+    if not observed_chroms:
+        raise ValueError("The observed DMC covers no chromosomes; nothing to permute.")
+    if chromosomes is not None and set(chromosomes) != set(observed_chroms):
+        raise ValueError(
+            f"chromosomes={sorted(chromosomes)} differs from the observed DMC "
+            f"universe {sorted(observed_chroms)}. Permutations must replay the "
+            f"same scan; rerun ep.tl.dmc(md, chromosomes=...) with that restriction "
+            f"and then call ep.tl.dmr."
+        )
+
+    dmc_kwargs: dict[str, Any] = {"test": test_used}
+    dmc_kwargs.update({k: meta[k] for k in _CHAIN_MERGE_REPLAY_KEYS})
+    if meta.get("smoothing"):
+        dmc_kwargs["smoothing_span_bp"] = meta["smoothing_span_bp"]
+    return dmc_kwargs, meta["fdr_method"], list(observed_chroms)
+
+
+def dmr(
+    md: MethylData,
+    method: str = "regional_gls",
+    # Parameter preset bundle (chain_merge only; see DMR_PRESETS) ----------
+    preset: str | None = None,
+    # Tile-method options ---------------------------------------------------
+    tile_size_bp: int = 1000,
+    min_cpgs_per_tile: int = 5,
+    test: str = "auto",
+    chromosomes: list[str] | None = None,
+    min_samples_treatment: int | None = None,
+    min_samples_control: int = 0,
+    dispersion: str = "site",
+    reference: str = "adaptive",
+    # Covariate design (tile-method only) ----------------------------------
+    design: str | None = None,
+    covariates: list[str] | None = None,
+    treatment_col: str = "treatment",
+    # Sliding-window / regional_gls options --------------------------------
+    window_bp: int = 500,
+    step_bp: int = 250,
+    min_cpgs: int | None = None,
+    min_sites_significant: int = 3,
+    # Chain-merge / regional_gls gap & span options ------------------------
+    dis_merge_bp: int = 500,
+    pct_sig: float = 0.5,
+    minlen_bp: int = 50,
+    use_q_for_sig: bool = False,
+    # Shared filters --------------------------------------------------------
+    alpha: float = 0.05,
+    min_abs_meth_diff: float = 0.1,
+    boundary_min_effect: float | None = None,
+    min_mean_qvalue: float | None = 0.05,
+    # Replicate-count guard --------------------------------------------------
+    allow_n1: bool = False,
+    # permutation-based empirical FDR ---------------------------------------
+    empirical_fdr: bool = False,
+    n_perm: int = 20,
+    perm_seed: int = 42,
+    perm_n_jobs: int = 1,
+    empirical_strata: str | None = None,
+    *,
+    backend: str = "sequential",
+    n_workers: int | None = None,
+    merge_adjacent: bool = True,
+    # Chromosome universe (regional_gls and tile) ---------------------------
+    canonical_only: bool = False,
+    # Permutation FDR construction ------------------------------------------
+    fdr_method: Literal["max_t", "region"] = "max_t",
+    # Auto-emits the DMR table to <analysis_root>/results/dmr.tsv by default;
+    # tsv=False disables, tsv="path" overrides. csv= is a deprecated alias.
+    tsv: str | bool | None = None,
+    csv: str | None = None,
+) -> None:
+    """Run DMR calling and store result in ``md.uns['dmr']``.
+
+    Backend selection (``method="tile"`` only)
+    ------------------------------------------
+    ``backend="sequential"`` (default) walks chromosomes one at a time.
+    ``backend="dask"`` / ``"ray"`` parallelise the per-chromosome DMC
+    pass run on the tiled methylstore; requires ``[distributed]`` or
+    ``[ray]``. ``n_workers`` controls pool size. The
+    ``method="sliding_window"`` path operates on the in-memory DMC table
+    and is unaffected by this setting.
+
+    Five methods are supported (see ``method`` below for the full list):
+
+    * ``method="regional_gls"`` (default, recommended) -- multiscale tricube
+      effect-based region discovery, CpG-level spatial GLS with locus
+      intercepts and an analytical REML biological donor random effect, and
+      complementary-orbit full-discovery label permutations. Requires
+      independent exchangeable samples (at least two per group); no upstream
+      DMC table is required. Uses ``window_bp`` (default 500), ``min_cpgs``
+      (default 3), ``dis_merge_bp`` (default 500), ``minlen_bp`` (default 50),
+      ``min_abs_meth_diff`` (default 0.1), ``n_perm`` (default 20), and
+      ``perm_seed`` (default 42). ``min_mean_qvalue`` filters permutation FDP
+      estimates (``combined_qvalue``); all candidates remain in
+      ``md.uns['dmr_candidates']``. ``n_workers`` controls native region-fit
+      threads (up to eight by default). Identical inputs/settings reuse complete
+      inference under ``analysis_root/.cache/regional_gls``. Complete decoy
+      scans, including empty scans, estimate false discovery counts at each
+      score threshold. ``combined_pvalue`` is a descriptive pooled score-tail
+      value, not an exact per-region randomization p-value. Balanced 3+3
+      designs have ten distinct two-sided label scans (9 non-self/mirror
+      unique fits). ``empirical_fdr=True, fdr_method="max_t"`` selects
+      ``maxT_pvalue`` instead: this whole-scan maximum diagnostic includes
+      observed/mirror scans and tests the joint all-null model.
+
+    * ``method="chain_merge"`` -- DSS-style
+      chaining of significant CpGs into regions; tune via ``preset``.
+      Requires a prior ``ep.tl.dmc(md)`` run.
+    * ``method="tile"`` -- aggregates read counts within fixed tiles and
+      runs a single test per tile. Requires direct access to ``md.store``
+      and the per-sample methylstore; does not need a prior DMC table.
+    * ``method="segment"`` -- rule-based 3-state segmentation over the
+      ``meth_diff`` signal with Stouffer-combined per-segment p-values.
+    * ``method="sliding_window"`` -- the legacy in-tree method: takes the
+      DMC result on ``md`` and combines per-CpG p-values within overlapping
+      windows with signed Stouffer's Z. Faster (no extra I/O) but
+      substantially lower-power than ``regional_gls`` or tile-based
+      aggregation at typical WGBS coverage.
+
+    Region-level FDR calibration (important)
+    ----------------------------------------
+    ``regional_gls`` computes empirical permutation FDP ``combined_qvalue``
+    directly by replaying full-genome multiscale discovery and analytical
+    REML GLS fitting across shuffled sample labels.
+    Chain-merge ``combined_qvalue`` uses BY over every geometry-admissible
+    interval, with unreported intervals assigned p=1. This accounts for
+    data-dependent span selection and dependence between overlapping
+    interval hypotheses, provided fixed-interval raw p-values are valid.
+    Sliding-window / segment ``combined_qvalue`` and tile ``qvalue`` retain
+    their BH corrections. These non-GLS region scores use **asymptotic** per-CpG
+    combinations. Signed Stouffer assumes independent CpG statistics;
+    within-region correlation or miscalibrated site p-values can invalidate
+    nominal region significance even after search correction. Empirical
+    validation is therefore required before interpreting them as region FDR.
+    An optional label-permutation calculation uses ``empirical_fdr=True`` with ``method="tile"``
+    or ``method="chain_merge"``, which re-runs the caller on shuffled labels
+    and adds permutation ``empirical_pvalue`` / ``empirical_qvalue`` /
+    ``empirical_fdr_set`` columns; threshold ``empirical_qvalue`` instead of
+    ``combined_qvalue``. ``fdr_method="max_t"`` (default)
+    keeps the Westfall-Young min-P construction; ``fdr_method="region"``
+    selects the count-ratio target-decoy FDR and records the set-level
+    estimate in ``md.uns["dmr_params"]["empirical_fdr_set"]``. Every
+    non-GLS ``tl.dmr`` call logs a one-time INFO note about this caveat.
+
+    Parameters
+    ----------
+    method : {"regional_gls", "chain_merge", "tile", "sliding_window", "segment"}
+        Which DMR algorithm to run. Default is ``"regional_gls"``.
+    preset : {"strict", "default", "permissive"}, optional
+        Parameter preset bundle for ``method="chain_merge"``. Applies
+        ``(alpha, min_abs_meth_diff, dis_merge_bp, min_cpgs, pct_sig,
+        minlen_bp)`` from :data:`epykit.tl.DMR_PRESETS` for the chosen
+        bundle. Any explicit kwarg passed alongside ``preset`` overrides
+        the bundled value. Ignored for other methods.
+
+        Preset summary:
+
+        * ``"strict"`` -- validation-ready DMRs only (alpha=1e-6,
+          min_cpgs=5, min_abs_meth_diff=0.20). DSS-strict alpha.
+        * ``"default"`` -- conservative seed gate (alpha=1e-4, min_cpgs=3,
+          min_abs_meth_diff=0.10). Spatial model adjustment and the complete
+          search-family correction still require empirical calibration.
+        * ``"permissive"`` -- recall-oriented (alpha=1e-4,
+          dis_merge_bp=1000, min_abs_meth_diff=0.05). Expect lower PPV.
+    tile_size_bp, min_cpgs_per_tile : int
+        Tile-method options. Default ``tile_size_bp=1000``.
+    test : str
+        Statistical test for tile-method (ignored when ``method="sliding_window"``).
+        ``"auto"`` resolves the same way as in :func:`dmc`.
+    chromosomes : list[str], optional
+        Restrict tile-method processing to these chromosomes. An explicit
+        list, including an empty one, is used verbatim and takes
+        precedence over ``canonical_only``.
+    canonical_only : bool, keyword-only
+        ``method="tile"`` only. When ``chromosomes`` is None, keep only the
+        fixed human-style chromosome set (``1``-``22``, ``X``, ``Y``,
+        ``M``/``MT``, with or without a ``chr`` prefix) of the auto-detected
+        partitions; the same resolved list is used for the observed tiles
+        and every ``empirical_fdr`` permutation, and the option is recorded
+        in ``md.uns["dmr_params"]``. The DMC-derived methods
+        (``chain_merge``, ``sliding_window``) inherit the
+        chromosome universe of the upstream DMC run and raise
+        ``ValueError`` on ``canonical_only=True``: filter upstream instead
+        (ingest with ``canonical_only=True`` or restrict ``tl.dmc`` with
+        ``chromosomes=``). Default False.
+    min_samples_treatment, min_samples_control : int
+        Per-tile sample-count guard for tile-method.
+    window_bp, step_bp, min_sites_significant : int
+        Sliding-window method options.
+    min_cpgs : int or None
+        Minimum CpGs per DMR. ``None`` (the default) resolves per method:
+        ``3`` for ``regional_gls``; ``5`` for ``sliding_window`` / ``segment``;
+        for ``chain_merge`` it defers to the active ``preset``'s value, or
+        ``5`` when no preset is given (preserving the documented chain_merge
+        default). An explicit integer always wins and overrides a preset.
+    alpha : float
+        q-value threshold for "significant" at the DMC / tile level
+        (used by both methods, with different downstream meanings).
+    min_abs_meth_diff : float
+        Minimum |meth_diff| for a DMC / tile to count.
+    min_mean_qvalue : float or None
+        post-hoc filter on the DMR-level **q-value**
+        (``combined_qvalue`` for sliding-window, ``qvalue`` for tile).
+        DMRs with q >= ``min_mean_qvalue`` are dropped. Set to None to keep
+        all candidate DMRs. Default 0.05.
+
+        This parameter was previously named ``min_mean_pvalue`` and applied
+        to the uncorrected p-value, which was not FDR-controlled across the
+        DMR set.
+    empirical_fdr : bool
+        Run the permutation FDR after the observed call. Implemented for
+        ``method="tile"`` and ``method="chain_merge"``; the other methods
+        raise ``NotImplementedError``. The chain_merge harness recomputes
+        the per-CpG DMC for every permutation with the knobs recorded in
+        ``md.uns["dmc"]`` (two-group ``lr`` / ``welch_t`` / ``fisher`` only;
+        GLM, contrast and ``use_smoothed`` DMCs are rejected), over the
+        observed chromosome universe, so a whole-genome run is expensive.
+    n_perm, perm_seed, perm_n_jobs : int
+        Permutation count (positive), seed and joblib worker count.
+    empirical_strata : str or None
+        ``md.obs`` column whose labels define shuffle strata (paired
+        designs). The column must exist and cover every treatment /
+        control sample; otherwise ``tl.dmr`` raises instead of falling
+        back to an unrestricted shuffle.
+    fdr_method : {"max_t", "region"}
+        Permutation FDR construction. ``"max_t"`` (default) is the
+        Westfall-Young min-P statistic with a BH transform.
+        ``"region"`` is the count-ratio target-decoy FDR: the mean decoy
+        survivor count divided by the observed survivor count at each
+        threshold, made monotone; ``empirical_pvalue`` is then the
+        pooled-null tail fraction, a diagnostic. Self / mirror
+        assignments and failed permutations are excluded in this mode.
+    """
+    if min_samples_treatment is None:
+        min_samples_treatment = 0
+    tsv, _, _, _tsv_is_auto = _resolve_auto_tsv(md, tsv, csv, default_name="dmr.tsv")
+    if method == "regional_gls":
+        if design is not None or covariates or empirical_strata is not None:
+            raise NotImplementedError("regional_gls currently requires independent exchangeable samples; covariate/paired permutation designs are not yet implemented")
+        if preset is not None or backend != "sequential":
+            raise ValueError("regional_gls requires explicit geometry and backend='sequential'")
+        if boundary_min_effect is not None and not (0 < boundary_min_effect <= min_abs_meth_diff):
+            raise ValueError(
+                f"boundary_min_effect must satisfy 0 < boundary_min_effect <= min_abs_meth_diff "
+                f"({min_abs_meth_diff}), got {boundary_min_effect}"
+            )
+        from ._regional_gls import run_regional_gls
+        if empirical_fdr and fdr_method not in {"max_t", "region"}:
+            raise ValueError("regional_gls empirical fdr_method must be max_t or region")
+        frame, candidates, params = run_regional_gls(md, chromosomes=chromosomes,
+            canonical_only=canonical_only, window_bp=window_bp,
+            min_cpgs=3 if min_cpgs is None else min_cpgs, max_gap=dis_merge_bp,
+            min_length=minlen_bp, min_effect=min_abs_meth_diff,
+            boundary_min_effect=boundary_min_effect, n_perm=n_perm,
+            seed=perm_seed, q_cutoff=min_mean_qvalue, workers=n_workers,
+            selection_method="max_t" if empirical_fdr and fdr_method == "max_t" else "experimental_fdp")
+        md.uns["dmr"], md.uns["dmr_candidates"], md.uns["dmr_params"] = frame, candidates, params
+        if tsv is not None:
+            from .export import dmr_to_tsv
+            _emit_result_tsv(lambda: dmr_to_tsv(md, tsv), tsv, is_auto=_tsv_is_auto)
+        return
+    if boundary_min_effect is not None:
+        raise ValueError(
+            f"boundary_min_effect is only supported for method='regional_gls'; got method={method!r}"
+        )
+    # M2 (Batch-1): empirical_fdr is wired for method='tile' and, since the
+    # chain_merge harness landed, method='chain_merge'. The sliding_window /
+    # segment branches previously accepted the kwarg and silently no-op'd
+    # (no empirical_pvalue / empirical_qvalue columns added), AND suppressed
+    # the calibration-warning note. Raise explicitly so users don't
+    # unknowingly threshold combined_qvalue as if it were FDR-controlled.
+    # Permutation harnesses for the remaining callers are a follow-up (each
+    # caller's region definition needs its own shuffle scheme).
+    if empirical_fdr and method not in ("tile", "chain_merge"):
+        raise NotImplementedError(
+            f"empirical_fdr=True is implemented for method='tile' and "
+            f"method='chain_merge'. Got method={method!r}. Use one of those "
+            f"or omit empirical_fdr=True. (Follow-up: permutation FDR for "
+            f"sliding_window / segment.)"
+        )
+    # canonical_only is tile-only: the other callers take their chromosome
+    # universe from the DMC table, and filtering a finished q-value table
+    # would silently change its multiple-testing burden. Refuse up front,
+    # before any DMC lookup, and say where the filter belongs.
+    if canonical_only and method != "tile":
+        raise ValueError(
+            f"canonical_only=True applies to method='tile' only; got method={method!r}. "
+            "The DMC-derived callers use the chromosome universe of the upstream "
+            "DMC run, so filter there: run ep.tl.dmc(md, canonical_only=True), "
+            "ingest with canonical_only=True, or restrict ep.tl.dmc(md, "
+            "chromosomes=...), then call tl.dmr without canonical_only."
+        )
+    # Asymptotic DMR q-values are a ranking signal, not a calibrated
+    # region-level FDR under CpG spatial correlation (M5). Point users at
+    # empirical_fdr=True for calibrated inference. Fired regardless of the
+    # flag: for non-tile methods the flag now raises before getting here,
+    # and for the tile path users still benefit from seeing the caveat
+    # (the empirical run uses the same Stouffer combine internally).
+    _note_dmr_fdr_calibration_once()
+    if method == "tile":
+        _check_n1_and_union_footgun(
+            md,
+            allow_n1,
+            min_samples_treatment,
+            min_samples_control,
+            unit="tiles",
+        )
+        selected_test = (
+            _auto_test(md, design=design, covariates=covariates, allow_n1=allow_n1)
+            if test == "auto"
+            else test
+        )
+        if selected_test == "fisher":
+            _warn_fisher_once()
+        unite_info = md.uns.get("unite")
+        unite = (unite_info is not None) and (unite_info.get("type") == "intersect")
+
+        # ---- Build covariate design matrix when requested -----------------
+        design_full = None
+        design_reduced = None
+        coef_idx = None
+        term_names: list[str] = []
+        formula_used: str | None = None
+        if selected_test == "glm" or design is not None or covariates is not None:
+            from ._glm import build_design
+
+            samples_ordered = md.treatment_ids + md.control_ids
+            design_full, design_reduced, coef_idx, term_names, formula_used = build_design(
+                md.obs,
+                samples_ordered=samples_ordered,
+                formula=design,
+                covariates=covariates,
+                treatment_col=treatment_col,
+            )
+            # Force GLM regardless of what 'auto' resolved to: covariates only
+            # work with the GLM path.
+            selected_test = "glm"
+
+        # Resolve the chromosome universe once (one audit line) and hand the
+        # same explicit list to the observed run and every permutation.
+        tile_chromosomes = _resolve_tile_chromosomes(
+            md.store, chromosomes, canonical_only=canonical_only
+        )
+        dmr_df = call_dmr_tile_based(
+            methylstore_path=md.store,
+            samples_treatment=md.treatment_ids,
+            samples_control=md.control_ids,
+            tile_size_bp=tile_size_bp,
+            test=selected_test,
+            chromosomes=tile_chromosomes,
+            min_cpgs_per_tile=min_cpgs_per_tile,
+            alpha=alpha,
+            min_abs_meth_diff=min_abs_meth_diff,
+            unite=unite,
+            min_samples_treatment=min_samples_treatment,
+            min_samples_control=min_samples_control,
+            dispersion=dispersion,
+            reference=reference,
+            design_full=design_full,
+            design_reduced=design_reduced,
+            coef_idx=coef_idx,
+            backend=backend,
+            n_workers=n_workers,
+            merge_adjacent=merge_adjacent,
+        )
+
+        # Optional q-value post-filter (the tile path already filtered at
+        # `alpha`, but a stricter user threshold is allowed here). Shared with
+        # the CLI tile branch via apply_region_qfilter so the two cannot drift;
+        # tile filters on the per-tile `qvalue` column only.
+        dmr_df = apply_region_qfilter(dmr_df, min_mean_qvalue, candidate_cols=("qvalue",))
+
+        # permutation FDR. Refuses to run when a covariate design
+        # is in play (shuffling treatment labels invalidates the assumed
+        # covariate structure).
+        if empirical_fdr:
+            if design is not None or (covariates is not None and len(covariates) > 0):
+                raise ValueError(
+                    "empirical_fdr=True is not supported with covariate "
+                    "designs (label-shuffling invalidates stratification). "
+                    "Use a stratified-permutation scheme manually if needed."
+                )
+            # Build strata map from obs column when empirical_strata= supplied;
+            # a missing or incomplete column raises before any permutation.
+            strata_map = _empirical_strata_map(md, empirical_strata)
+            if len(dmr_df) > 0:
+                dmr_df = empirical_fdr_for_dmr(
+                    methylstore_path=md.store,
+                    samples_treatment=md.treatment_ids,
+                    samples_control=md.control_ids,
+                    observed_dmr=dmr_df,
+                    n_perm=n_perm,
+                    seed=perm_seed,
+                    n_jobs=perm_n_jobs,
+                    empirical_strata=strata_map,
+                    tile_size_bp=tile_size_bp,
+                    test=selected_test,
+                    chromosomes=tile_chromosomes,
+                    min_cpgs_per_tile=min_cpgs_per_tile,
+                    alpha=alpha,
+                    min_abs_meth_diff=min_abs_meth_diff,
+                    unite=unite,
+                    min_samples_treatment=min_samples_treatment,
+                    min_samples_control=min_samples_control,
+                    dispersion=dispersion,
+                    reference=reference,
+                    merge_adjacent=merge_adjacent,
+                    backend=backend,
+                    fdr_method=fdr_method,
+                    min_mean_qvalue=min_mean_qvalue,
+                )
+
+        md.uns["dmr"] = dmr_df
+        md.uns["dmr_params"] = {
+            "method": "tile",
+            "tile_size_bp": tile_size_bp,
+            "min_cpgs_per_tile": min_cpgs_per_tile,
+            "test": selected_test,
+            "alpha": alpha,
+            "min_abs_meth_diff": min_abs_meth_diff,
+            "min_mean_qvalue": min_mean_qvalue,
+            "min_samples_treatment": min_samples_treatment,
+            "min_samples_control": min_samples_control,
+            "unite": unite,
+            "dispersion": dispersion,
+            "reference": reference,
+            "design": design,
+            "covariates": list(covariates) if covariates else None,
+            "treatment_col": treatment_col,
+            "formula_used": formula_used,
+            "design_terms": term_names if term_names else None,
+            "canonical_only": canonical_only,
+            "empirical_fdr": empirical_fdr,
+            "n_perm": n_perm if empirical_fdr else None,
+            "perm_seed": perm_seed if empirical_fdr else None,
+            "fdr_method": fdr_method if empirical_fdr else None,
+            "empirical_fdr_set": _empirical_fdr_set_value(dmr_df) if empirical_fdr else None,
+        }
+        if tsv is not None:
+            from .export import dmr_to_tsv
+
+            _emit_result_tsv(lambda: dmr_to_tsv(md, tsv), tsv, is_auto=_tsv_is_auto)
+        return
+
+    if method == "sliding_window":
+        # Prefer streaming from the persistent DMC store when ep.tl.dmc
+        # has staged one -- keeps DMR peak memory at O(largest chrom)
+        # instead of holding the full 22M-row DataFrame plus a per-chrom
+        # working set in memory at the same time.
+        dmc_store_path = md.uns.get("dmc", {}).get("store_path")
+        dmc_input: object
+        if dmc_store_path:
+            from pathlib import Path as _Path
+
+            from ._dmc_store import DMCStore
+
+            store_path = _Path(dmc_store_path)
+            if (store_path / ".epykit_dmc_manifest.json").exists():
+                dmc_input = DMCStore.open(store_path)
+            else:
+                dmc_input = md.dmc
+        else:
+            dmc_input = md.dmc
+
+        if dmc_input is None:
+            raise ValueError(
+                "No DMC results available. Run ep.tl.dmc(md) first, or use "
+                "method='tile' which goes directly to the methylstore."
+            )
+
+        # None sentinel -> sliding_window's documented default of 5.
+        sw_min_cpgs = min_cpgs if min_cpgs is not None else _DMR_DEFAULT_MIN_CPGS
+        dmr_df = call_dmr_sliding_window(
+            dmc_results=dmc_input,
+            window_bp=window_bp,
+            step_bp=step_bp,
+            min_cpgs=sw_min_cpgs,
+            min_sites_significant=min_sites_significant,
+            alpha=alpha,
+            min_abs_meth_diff=min_abs_meth_diff,
+        )
+        # filter on the BH-corrected DMR-level q-value, not the raw
+        # combined p-value. ``call_dmr_sliding_window`` now adds
+        # ``combined_qvalue`` itself. Shared with the CLI via
+        # apply_region_qfilter (default candidate cols).
+        dmr_df = apply_region_qfilter(dmr_df, min_mean_qvalue)
+
+        md.uns["dmr"] = dmr_df
+        md.uns["dmr_params"] = {
+            "method": "sliding_window",
+            "window_bp": window_bp,
+            "step_bp": step_bp,
+            "min_cpgs": sw_min_cpgs,
+            "min_sites_significant": min_sites_significant,
+            "alpha": alpha,
+            "min_abs_meth_diff": min_abs_meth_diff,
+            "min_mean_qvalue": min_mean_qvalue,
+        }
+        if tsv is not None:
+            from .export import dmr_to_tsv
+
+            _emit_result_tsv(lambda: dmr_to_tsv(md, tsv), tsv, is_auto=_tsv_is_auto)
+        return
+
+    if method == "chain_merge":
+        # DSS::callDMR semantics -- chain contiguous sig CpGs whose gap is
+        # <= dis_merge_bp, then filter by minlen_bp / min_cpgs / pct_sig.
+        # Reuses the same DMC store as sliding_window when available so a
+        # 22M-CpG run stays streaming-friendly.
+        dmc_store_path = md.uns.get("dmc", {}).get("store_path")
+        if dmc_store_path:
+            from pathlib import Path as _Path
+
+            from ._dmc_store import DMCStore
+
+            store_path = _Path(dmc_store_path)
+            if (store_path / ".epykit_dmc_manifest.json").exists():
+                dmc_input = DMCStore.open(store_path)
+            else:
+                dmc_input = md.dmc
+        else:
+            dmc_input = md.dmc
+
+        if dmc_input is None:
+            raise ValueError(
+                "method='chain_merge' needs a DMC table on md. Run ep.tl.dmc(md) first."
+            )
+
+        # Resolve min_cpgs with a None sentinel (M10) via the shared
+        # layer-level resolver so the CLI and tl.dmr agree exactly: explicit
+        # value wins; else the active preset's value; else 5 -- the
+        # documented chain_merge default, which keeps the benchmark paper's
+        # bare-default behavior unchanged. We compute the concrete value
+        # here (rather than threading None into the engine) so dmr_params
+        # records the value actually used, and pass it explicitly so it
+        # overrides the engine's own preset resolution deterministically.
+        # The resolver also validates ``preset`` (friendly ValueError, not a
+        # bare KeyError, on a typo'd preset name).
+        cm_min_cpgs = resolve_layer_min_cpgs(min_cpgs, preset)
+        # One kwargs dict for the observed call and every permutation, so the
+        # decoy regions are defined by exactly the observed chain_merge knobs.
+        cm_kwargs: dict[str, Any] = {
+            "preset": preset,
+            "alpha": alpha,
+            "min_abs_meth_diff": min_abs_meth_diff,
+            "dis_merge_bp": dis_merge_bp,
+            "min_cpgs": cm_min_cpgs,
+            "pct_sig": pct_sig,
+            "minlen_bp": minlen_bp,
+            "use_q_for_sig": use_q_for_sig,
+        }
+        dmr_df = call_dmr_chain_merge(dmc_input, **cm_kwargs)
+
+        # Filter the complete-search BY adjusted values from chain_merge.
+        # Shared with the CLI via apply_region_qfilter (default candidate cols).
+        dmr_df = apply_region_qfilter(dmr_df, min_mean_qvalue)
+
+        if empirical_fdr:
+            # Permutation FDR: replay the observed DMC (shuffled labels) ->
+            # observed multiple-testing correction -> chain_merge -> same
+            # q-filter per shuffle, then compare survivors with the decoys.
+            # Every rejection (GLM / contrast / use_smoothed DMC, missing
+            # metadata, a chromosome restriction that differs from the
+            # observed universe, a bad strata column) happens before the
+            # first permutation runs.
+            cm_dmc_kwargs, cm_dmc_fdr_method, cm_chroms = _chain_merge_permutation_inputs(
+                md, dmc_input, chromosomes
+            )
+            cm_strata_map = _empirical_strata_map(md, empirical_strata)
+            if len(dmr_df) > 0:
+                dmr_df = empirical_fdr_for_chain_merge(
+                    methylstore_path=md.store,
+                    samples_treatment=md.treatment_ids,
+                    samples_control=md.control_ids,
+                    observed_dmr=dmr_df,
+                    chromosomes=cm_chroms,
+                    dmc_kwargs=cm_dmc_kwargs,
+                    chain_merge_kwargs=cm_kwargs,
+                    dmc_fdr_method=cm_dmc_fdr_method,
+                    min_mean_qvalue=min_mean_qvalue,
+                    n_perm=n_perm,
+                    seed=perm_seed,
+                    n_jobs=perm_n_jobs,
+                    empirical_strata=cm_strata_map,
+                    fdr_method=fdr_method,
+                )
+
+        md.uns["dmr"] = dmr_df
+        md.uns["dmr_params"] = {
+            "method": "chain_merge",
+            "region_correction": "complete-interval-family-by-v1",
+            "alpha": alpha,
+            "min_abs_meth_diff": min_abs_meth_diff,
+            "dis_merge_bp": dis_merge_bp,
+            "min_cpgs": cm_min_cpgs,
+            "pct_sig": pct_sig,
+            "minlen_bp": minlen_bp,
+            "use_q_for_sig": use_q_for_sig,
+            "min_mean_qvalue": min_mean_qvalue,
+            "empirical_fdr": empirical_fdr,
+            "n_perm": n_perm if empirical_fdr else None,
+            "perm_seed": perm_seed if empirical_fdr else None,
+            "fdr_method": fdr_method if empirical_fdr else None,
+            "empirical_fdr_set": _empirical_fdr_set_value(dmr_df) if empirical_fdr else None,
+        }
+        if tsv is not None:
+            from .export import dmr_to_tsv
+
+            _emit_result_tsv(lambda: dmr_to_tsv(md, tsv), tsv, is_auto=_tsv_is_auto)
+        return
+
+    raise ValueError(
+        f"Unknown DMR method '{method}'. Expected 'tile', 'sliding_window', "
+        f"'segment', 'chain_merge', or 'regional_gls'."
+    )
+
+
+def diagnose_dmr_calling(
+    md: MethylData,
+    reference_dmrs: pl.DataFrame,
+    *,
+    dmc_key: str | None = None,
+    chromosomes: list[str] | None = None,
+    alpha_threshold: float = 1e-5,
+) -> dict:
+    """Classify reference DMRs by recovery status to debug missing-DMR causes.
+
+    Given a reference DMR set (e.g. from a published paper or another
+    pipeline), bucket each reference DMR by *why* epykit's current DMC +
+    DMR-calling produced (or didn't produce) an overlapping DMR. Lets
+    you diagnose a low recall number into actionable categories instead
+    of guessing which parameter to tune.
+
+    Five buckets:
+
+    * ``SUCCESS_OVERLAP`` -- our DMR set already contains a region that
+      overlaps this reference DMR. Nothing to fix.
+    * ``H1_NO_CPGS`` -- 0 of our united CpGs fall inside the reference
+      coordinates. The coverage filter or unite step dropped them;
+      relax ``min_coverage`` or use ``type="union"`` for ``pp.unite``.
+    * ``H2_NO_SIG_CPGS`` -- at least one CpG present but none reach
+      ``q < 0.05``. The DMC test statistic is too conservative for this
+      region. The only fix is a more powerful test (e.g. a spatial-
+      covariance Wald test); no DMR-caller tuning can recover this.
+    * ``H3a_WEAK_ALPHA`` -- has sig CpGs at ``q < 0.05`` but none reach
+      ``alpha_threshold`` (default 1e-5, matching DSS callDMR). Recover
+      by loosening ``alpha`` in :func:`ep.tl.dmr` (e.g. to 1e-4 or
+      1e-3, ideally via ``preset="permissive"``).
+    * ``H3b_STRUCTURE`` -- CpGs at ``q < alpha_threshold`` exist in the
+      region but no DMR was called. Chain-merge dropped the candidate
+      on a structural filter: ``min_cpgs``, ``pct_sig``, ``minlen_bp``,
+      or ``dis_merge_bp``. Loosen ``dis_merge_bp`` first (highest
+      Pareto leverage), then ``min_cpgs``.
+
+    Parameters
+    ----------
+    md : MethylData
+        Must have a DMC table populated (``ep.tl.dmc`` already run) and
+        ``md.uns['dmr']`` populated (``ep.tl.dmr`` already run).
+    reference_dmrs : polars DataFrame
+        Reference DMR set with at least ``chrom``, ``start``, ``end``
+        columns. Coordinates assumed 0-based half-open (BED convention).
+    dmc_key : str, optional
+        Specific key in ``md.varm`` to use as the DMC table. Defaults to
+        ``md.uns['dmc']['last_key']``.
+    chromosomes : list of str, optional
+        Restrict analysis to these chromosomes (e.g. main chroms only,
+        skipping ``_random`` / alt contigs). Defaults to all chromosomes
+        present in both the reference and the DMC table.
+    alpha_threshold : float, default 1e-5
+        The per-CpG significance cutoff that was used in chain-merge.
+        Determines the H3a vs H3b boundary. Pass the same value you used
+        in ``ep.tl.dmr(alpha=...)`` so the diagnosis matches your run.
+
+    Returns
+    -------
+    dict with keys:
+
+    * ``"counts"`` (dict[str, int]) -- count per bucket
+    * ``"bucket_indices"`` (dict[str, list[int]]) -- 0-based row indices
+      into ``reference_dmrs`` for each bucket
+    * ``"n_reference"`` (int) -- total reference DMRs analyzed
+    * ``"summary"`` (str) -- multi-line human-readable summary
+    * ``"alpha_threshold"`` (float) -- the threshold used
+    """
+    from collections import defaultdict
+
+    import numpy as np
+
+    # ---- Resolve inputs ----
+    if dmc_key is None:
+        dmc_key = md.uns.get("dmc", {}).get("last_key")
+    if dmc_key is None or dmc_key not in md.varm:
+        raise ValueError(
+            "No DMC table found on md. Run ep.tl.dmc(md, ...) first, or pass dmc_key= explicitly."
+        )
+    dmc = md.varm[dmc_key]
+
+    if "dmr" not in md.uns:
+        raise ValueError(
+            "No DMR table found at md.uns['dmr']. Run ep.tl.dmr(md, ...) "
+            "first so the diagnostic knows which reference DMRs we recovered."
+        )
+    ours_dmr = md.uns["dmr"]
+
+    # Normalize reference column types
+    ref = reference_dmrs.with_columns(
+        [
+            pl.col("chrom").cast(pl.Utf8),
+            pl.col("start").cast(pl.Int64),
+            pl.col("end").cast(pl.Int64),
+        ]
+    )
+
+    # Optional chromosome filter
+    if chromosomes is not None:
+        chrom_set = set(chromosomes)
+        ref = ref.filter(pl.col("chrom").is_in(chrom_set))
+
+    # Pick the q-value column on the DMC table (prefer qvalue over pvalue)
+    qcol = "qvalue" if "qvalue" in dmc.columns else ("pvalue" if "pvalue" in dmc.columns else None)
+    if qcol is None:
+        raise ValueError(
+            f"DMC table at varm[{dmc_key!r}] has neither 'qvalue' nor "
+            f"'pvalue' columns; cannot diagnose."
+        )
+    pos_col = "pos" if "pos" in dmc.columns else "start"
+
+    # ---- Build indexed lookups ----
+    # Our DMRs: chrom -> sorted [(start, end), ...]
+    ours_by_chr: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for r in ours_dmr.iter_rows(named=True):
+        ours_by_chr[str(r["chrom"])].append((int(r["start"]), int(r["end"])))
+    for c in ours_by_chr:
+        ours_by_chr[c].sort()
+
+    def _has_overlap(intervals, s, e):
+        # Linear scan is fine for typical DMR-set sizes; bisect would help
+        # only with 100k+ DMRs which is unusual.
+        for ps, pe in intervals:
+            if pe < s:
+                continue
+            if ps > e:
+                break
+            return True
+        return False
+
+    # DMC table: per-chrom (sorted positions array, q-values array). We
+    # convert to numpy for searchsorted speed; the cost is O(n_cpgs) per
+    # chromosome but only paid once across all reference DMRs.
+    dmc_pd = dmc.to_pandas()
+    dmc_pd["chrom"] = dmc_pd["chrom"].astype(str)
+    dmc_by_chr: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for chrom, g in dmc_pd.groupby("chrom"):
+        if chromosomes is not None and chrom not in chrom_set:
+            continue
+        g = g.sort_values(pos_col)
+        dmc_by_chr[chrom] = (
+            g[pos_col].to_numpy(dtype=np.int64),
+            g[qcol].to_numpy(dtype=np.float64),
+        )
+
+    # ---- Classify ----
+    buckets: dict[str, list[int]] = {
+        "SUCCESS_OVERLAP": [],
+        "H1_NO_CPGS": [],
+        "H2_NO_SIG_CPGS": [],
+        "H3a_WEAK_ALPHA": [],
+        "H3b_STRUCTURE": [],
+    }
+
+    for idx, r in enumerate(ref.iter_rows(named=True)):
+        chrom = str(r["chrom"])
+        rs, re_ = int(r["start"]), int(r["end"])
+
+        # Bucket 0: already recovered?
+        if _has_overlap(ours_by_chr.get(chrom, []), rs, re_):
+            buckets["SUCCESS_OVERLAP"].append(idx)
+            continue
+
+        # Bucket H1: no CpGs in the region
+        entry = dmc_by_chr.get(chrom)
+        if entry is None:
+            buckets["H1_NO_CPGS"].append(idx)
+            continue
+        pos_arr, q_arr = entry
+        lo = int(np.searchsorted(pos_arr, rs, side="left"))
+        hi = int(np.searchsorted(pos_arr, re_, side="right"))
+        if lo == hi:
+            buckets["H1_NO_CPGS"].append(idx)
+            continue
+
+        region_q = q_arr[lo:hi]
+        min_q = float(np.nanmin(region_q))
+
+        if min_q >= 0.05:
+            buckets["H2_NO_SIG_CPGS"].append(idx)
+        elif min_q >= alpha_threshold:
+            buckets["H3a_WEAK_ALPHA"].append(idx)
+        else:
+            buckets["H3b_STRUCTURE"].append(idx)
+
+    # ---- Assemble result ----
+    counts = {k: len(v) for k, v in buckets.items()}
+    n_ref = sum(counts.values())
+
+    # Build a human-readable summary
+    lines = [
+        f"DMR-calling diagnostic on {n_ref} reference DMRs:",
+        f"  alpha_threshold = {alpha_threshold:.0e}  (matches chain-merge alpha)",
+        "",
+    ]
+    bucket_help = {
+        "SUCCESS_OVERLAP": "already recovered (no fix needed)",
+        "H1_NO_CPGS": "no CpGs present  -> coverage/unite issue",
+        "H2_NO_SIG_CPGS": "no sig CpGs at q<0.05  -> need better test stat (e.g. Wald-smoothed)",
+        "H3a_WEAK_ALPHA": f"sig CpGs at q<0.05 but not q<{alpha_threshold:.0e}  -> loosen alpha (preset='permissive')",
+        "H3b_STRUCTURE": "sig CpGs exist but chain-merge dropped  -> loosen dis_merge_bp first",
+    }
+    for name in (
+        "SUCCESS_OVERLAP",
+        "H1_NO_CPGS",
+        "H2_NO_SIG_CPGS",
+        "H3a_WEAK_ALPHA",
+        "H3b_STRUCTURE",
+    ):
+        n = counts[name]
+        pct = n / max(n_ref, 1)
+        lines.append(f"  {name:<18} {n:>5} ({pct:>5.1%})  -- {bucket_help[name]}")
+
+    return {
+        "counts": counts,
+        "bucket_indices": buckets,
+        "n_reference": n_ref,
+        "summary": "\n".join(lines),
+        "alpha_threshold": alpha_threshold,
+    }
+
+
+def annotate(
+    md: MethylData,
+    gtf: str | None = None,
+    cpg_islands: str | None = None,
+    significant_only: bool = True,
+    alpha: float = 0.05,
+    promoter_upstream_bp: int = 2000,
+    promoter_downstream_bp: int = 200,
+    clear_gtf_cache: bool = True,
+    multi_annotation: bool = True,
+    *,
+    refgene: str | None = None,
+    gene_type_filter: str | list[str] | tuple[str, ...] | None = None,
+    features: list[str] | tuple[str, ...] | None = None,
+    # Auto-emits the annotated DMC table to
+    # <analysis_root>/results/dmc_annotated.tsv by default; tsv=False disables,
+    # tsv="path" overrides. csv= is a deprecated alias.
+    tsv: str | bool | None = None,
+    csv: str | None = None,
+) -> None:
+    """Annotate DMC/DMR outputs.
+
+    By default only significant DMCs are annotated to avoid OOM. Set
+    `significant_only=False` to annotate all sites (not recommended for
+    whole-genome datasets).
+
+    Parameters
+    ----------
+    gtf, refgene : str or None
+        Annotation source. Provide exactly one of ``gtf`` (GENCODE / Ensembl
+        GTF) or ``refgene`` (UCSC ``refGene.txt(.gz)`` -- HOMER's default
+        catalog, gives the highest paper-gene recall for methylation work
+        because it's curated and protein-coding-biased).
+    gene_type_filter : str or list of str or None, keyword-only
+        Restrict the gene catalog before building overlap intervals and the
+        nearest-TSS index. Typical: ``"protein_coding"`` to drop lincRNAs /
+        pseudogenes / novel predictions. Works on both sources.
+    clear_gtf_cache : bool, optional
+        If True (default), clear the GTF cache and run garbage collection
+        after annotation. Set to False if you plan to call annotate()
+        multiple times to reuse the cached GTF.
+    multi_annotation : bool, optional
+        If True (default), populate annotatr-style columns on every
+        annotated table: ``nearest_tss_gene`` / ``nearest_tss_distance``
+        (HOMER's nearest-TSS rule), plus ``all_overlapping_genes`` /
+        ``all_overlapping_features`` (one-to-many). Set False to skip them
+        and keep only the legacy single-best gene-name columns. See
+        :func:`epykit.annotate.annotate_features` for details.
+    features : sequence of str or None, keyword-only
+        Override the feature classes built by
+        :func:`epykit.annotate.annotate_features`. Default ``None`` lets
+        the lower-level function pick its own default (the full HOMER set:
+        promoter / 5UTR / exon / intron / 3UTR / TTS / noncoding). Pass a
+        narrower tuple to skip categories -- e.g.
+        ``("promoter", "exon", "intron")`` for the pre-0.x coarse
+        breakdown when downstream code expects only those buckets.
+    """
+    if gtf and refgene:
+        raise ValueError("Provide only one of gtf or refgene, not both")
+    feature_source_present = bool(gtf or refgene)
+    if not feature_source_present and not cpg_islands:
+        raise ValueError("Provide at least one of gtf / refgene / cpg_islands")
+
+    for key, df in list(md.varm.items()):
+        if not key.startswith("dmc"):
+            continue
+
+        # Match old behavior: annotate only significant sites to avoid OOM
+        if significant_only:
+            p_col = "qvalue" if "qvalue" in df.columns else "pvalue"
+            ann = df.filter(pl.col(p_col) < alpha)
+        else:
+            ann = df
+
+        if len(ann) == 0:
+            continue
+
+        if feature_source_present:
+            # Pass through to the new annotate_features API. `gtf` and
+            # `refgene` are the wrapper-level convenience kwargs; under
+            # the hood there's one ``annotation`` argument with explicit
+            # source. We forward whichever the caller set.
+            annotation_path = gtf if gtf is not None else refgene
+            forwarded_source = "gtf" if gtf is not None else "refgene"
+            af_kwargs: dict[str, Any] = dict(
+                source=forwarded_source,
+                promoter_upstream_bp=promoter_upstream_bp,
+                promoter_downstream_bp=promoter_downstream_bp,
+                multi_annotation=multi_annotation,
+                gene_type_filter=gene_type_filter,
+            )
+            if features is not None:
+                af_kwargs["features"] = features
+            ann = annotate_features(ann, annotation_path, **af_kwargs)
+        if cpg_islands:
+            ann = annotate_cpg_islands(ann, cpg_island_bed=cpg_islands)
+
+        # Store as separate key so full DMC results are preserved
+        md.varm[f"{key}_annotated"] = ann
+
+    # DMR region table: annotate with the SAME feature + CpG-island context as
+    # the per-CpG loop above, so region-level (per-DMR) annotation charts have
+    # data. Mirror the DMC path -- gene features when a gene source is given,
+    # CpG-island context when a CpG-island BED is given; the two are
+    # independent (annotate_cpg_islands accepts region tables via start/end).
+    dmr_tbl = md.uns.get("dmr")
+    if isinstance(dmr_tbl, pl.DataFrame) and not dmr_tbl.is_empty():
+        if feature_source_present:
+            annotation_path = gtf if gtf is not None else refgene
+            forwarded_source = "gtf" if gtf is not None else "refgene"
+            af_kwargs = dict(
+                source=forwarded_source,
+                promoter_upstream_bp=promoter_upstream_bp,
+                promoter_downstream_bp=promoter_downstream_bp,
+                multi_annotation=multi_annotation,
+                gene_type_filter=gene_type_filter,
+            )
+            if features is not None:
+                af_kwargs["features"] = features
+            dmr_tbl = annotate_features(dmr_tbl, annotation_path, **af_kwargs)
+        if cpg_islands:
+            dmr_tbl = annotate_cpg_islands(dmr_tbl, cpg_island_bed=cpg_islands)
+        md.uns["dmr"] = dmr_tbl
+
+    md.uns["annotation"] = {
+        "gtf": gtf,
+        "refgene": refgene,
+        "cpg_islands": cpg_islands,
+        "significant_only": significant_only,
+        "alpha": alpha,
+        "promoter_upstream_bp": promoter_upstream_bp,
+        "promoter_downstream_bp": promoter_downstream_bp,
+        "multi_annotation": multi_annotation,
+        "gene_type_filter": gene_type_filter,
+        "features": list(features) if features is not None else None,
+    }
+
+    # Clear GTF cache if requested (default: True)
+    if clear_gtf_cache and gtf:
+        _GTF_CACHE.clear()
+        gc.collect()
+
+    # Auto-emit the annotated DMC table as a human-readable TSV (default on).
+    tsv_out, _, _, _tsv_is_auto = _resolve_auto_tsv(md, tsv, csv, default_name="dmc_annotated.tsv")
+    if tsv_out is not None and md.get_dmc(annotated=True) is not None:
+        from .export import dmc_to_tsv
+
+        _emit_result_tsv(
+            lambda: dmc_to_tsv(md, tsv_out, full=True),
+            tsv_out,
+            is_auto=_tsv_is_auto,
+        )

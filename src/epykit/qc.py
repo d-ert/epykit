@@ -1,0 +1,890 @@
+"""Quality control and reporting for Parquet methylation stores.
+
+Phase 5 of the epykit pipeline:
+  - bisulfite_conversion_rate: estimates library conversion efficiency from
+    CHH-context methylation (should be <0.5 % for a high-quality WGBS run).
+  - global_methylation_report: per-sample, per-context global methylation
+    levels with outlier detection.
+  - coverage_uniformity: per-chromosome breadth-of-coverage statistics with
+    automatic flagging of low-coverage samples.
+
+All functions read from the partitioned Parquet methylstore layout produced
+by epykit.convert and are intentionally lightweight: only the columns
+required for each metric are loaded.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+
+logger = logging.getLogger(__name__)
+
+# Thresholds used by coverage_uniformity for flagging
+_MIN_GENOME_COVERAGE_FRACTION = 0.80  # 80 % of CpGs at >=1x
+_CONVERSION_WARNING_THRESHOLD = 0.005  # 0.5 % CHH methylation
+
+# chromosome aliases used by qc.sex_check. Both UCSC ("chrX")
+# and Ensembl ("X") naming conventions are accepted.
+_X_CHROM_NAMES: tuple[str, ...] = ("chrX", "X")
+
+
+# Public API
+
+
+def bisulfite_conversion_rate(
+    methylstore_path: str,
+    sample: str,
+    chh_context_store: str,
+) -> float:
+    """Estimate bisulfite conversion efficiency from CHH-context methylation.
+
+    Under complete bisulfite conversion, non-CpG cytosines (CHH context) are
+    converted to uracil and read as thymine.  Residual CHH methylation
+    therefore reflects incomplete conversion.  Conversion efficiency is
+    estimated as 1 - mean(CHH beta).
+
+    A value below 99.5 % (i.e. >0.5 % residual CHH methylation) should be
+    flagged as a potential quality issue.
+
+    .. note::
+
+        This rate is **reported, not applied**. epykit's DMC / DMR tests
+        consume the raw ``count_methylated`` / ``count_unmethylated``
+        values exactly as Bismark / MethylDackel emit them; the
+        conversion rate is surfaced in the QC dashboard, the MultiQC
+        export, and the HTML report so users can gate their analysis on
+        it, but it is **not** used to rescale read counts before testing.
+        This matches the default behaviour of ``methylKit`` and the
+        ``bsseq`` family (``read.bismark`` etc.), which leave count-level
+        correction to the user. For a well-converted library (>=99.5 %)
+        the correction is statistically negligible; for a poorly
+        converted one the right action is usually to re-prep the
+        library, not to paper over the issue with a multiplicative
+        adjustment that distorts variance.
+
+    Parameters
+    ----------
+    methylstore_path : str
+        Path to the CpG Parquet methylstore (used only to verify that the
+        sample exists; not directly read by this function).
+    sample : str
+        Sample identifier.
+    chh_context_store : str
+        Path to a *separate* Parquet methylstore generated from CHH-context
+        Bismark output for the same sample.
+
+    Returns
+    -------
+    float
+        Estimated bisulfite conversion rate in [0, 1].
+        Values close to 1.0 indicate high-quality conversion.
+
+    Raises
+    ------
+    ValueError
+        If no CHH data is found for the given sample.
+    """
+    chh_store = Path(chh_context_store)
+    sample_dir = chh_store / f"sample={sample}"
+
+    if not sample_dir.exists():
+        raise ValueError(f"CHH store does not contain sample '{sample}': {sample_dir}")
+
+    # Honour the documented contract: verify the sample exists in the CpG
+    # methylstore the rate is reported alongside (warn rather than fail, since
+    # the rate is computed purely from the CHH store).
+    if methylstore_path:
+        cpg_sample_dir = Path(methylstore_path) / f"sample={sample}"
+        if not cpg_sample_dir.exists():
+            logger.warning(
+                "bisulfite_conversion_rate: sample '%s' not found in the CpG "
+                "methylstore %s; reporting the CHH-derived rate anyway.",
+                sample,
+                methylstore_path,
+            )
+
+    parts = list(sample_dir.rglob("part-*.parquet"))
+    if not parts:
+        raise ValueError(f"No Parquet files found for sample '{sample}' in {chh_store}")
+
+    # Load only the count columns; ignore chrom partition.
+    lf = pl.scan_parquet(str(sample_dir / "**" / "part-*.parquet"))
+    # Guard against being pointed at a non-CHH store: if a context column is
+    # present, restrict to CHH. A CpG store would otherwise silently return
+    # 1 - mean(CpG beta) ~= 0.2 as a bogus "conversion rate".
+    if "context" in lf.collect_schema().names():
+        lf = lf.filter(pl.col("context") == "CHH")
+    agg = lf.select(
+        [
+            pl.sum("N_meth").alias("total_meth"),
+            pl.sum("coverage").alias("total_cov"),
+        ]
+    ).collect()
+
+    total_meth = int(agg["total_meth"][0] or 0)
+    total_cov = int(agg["total_cov"][0] or 0)
+
+    if total_cov == 0:
+        raise ValueError(
+            f"Zero CHH coverage for sample '{sample}'. If you pointed "
+            f"chh_context_store at a CpG (or otherwise non-CHH) store, supply "
+            f"a CHH-context store instead."
+        )
+
+    mean_chh_methylation = total_meth / total_cov
+    conversion_rate = 1.0 - mean_chh_methylation
+
+    if mean_chh_methylation > _CONVERSION_WARNING_THRESHOLD:
+        logger.warning(
+            "Sample '%s': CHH methylation = %.3f %% > %.1f %% threshold; "
+            "consider checking library quality.",
+            sample,
+            mean_chh_methylation * 100,
+            _CONVERSION_WARNING_THRESHOLD * 100,
+        )
+    else:
+        logger.info(
+            "Sample '%s': conversion rate = %.4f %%",
+            sample,
+            conversion_rate * 100,
+        )
+
+    return float(conversion_rate)
+
+
+def global_methylation_report(
+    methylstore_path: str,
+    samples: list[str],
+    contexts: list[str] | None = None,
+) -> pl.DataFrame:
+    """Compute per-sample, per-context global methylation levels.
+
+    Reads methylation counts summed across the entire genome for each
+    requested sample.  When the methylstore contains a ``context`` column
+    (as written by epykit.convert), statistics are broken down by context
+    (CpG / CHG / CHH); otherwise a single "CpG" row is reported.
+
+    Outlier detection: samples whose global CpG methylation deviates by more
+    than 3 MAD from the cohort median are flagged.
+
+    Parameters
+    ----------
+    methylstore_path : str
+        Path to the partitioned Parquet methylstore.
+    samples : list[str]
+        Sample identifiers to include.
+    contexts : list[str], optional
+        Contexts to report (default: all contexts found in the store).
+
+    Returns
+    -------
+    pl.DataFrame
+        Columns: sample (Utf8), context (Utf8), n_sites (Int64),
+                 global_methylation (Float64), is_outlier (bool).
+    """
+    store = Path(methylstore_path)
+    rows: list[dict] = []
+
+    for sample in samples:
+        sample_dir = store / f"sample={sample}"
+        if not sample_dir.exists():
+            logger.warning("Sample '%s' not found; skipping", sample)
+            continue
+
+        lf = pl.scan_parquet(str(sample_dir / "**" / "part-*.parquet"))
+
+        # Determine if the context column is present
+        schema = lf.collect_schema()
+        has_context = "context" in schema
+
+        if has_context:
+            agg = (
+                lf.group_by("context")
+                .agg(
+                    [
+                        pl.len().alias("n_sites"),
+                        pl.sum("N_meth").alias("total_meth"),
+                        pl.sum("coverage").alias("total_cov"),
+                    ]
+                )
+                .collect()
+            )
+        else:
+            agg = (
+                lf.select(
+                    [
+                        pl.len().alias("n_sites"),
+                        pl.sum("N_meth").alias("total_meth"),
+                        pl.sum("coverage").alias("total_cov"),
+                    ]
+                )
+                .collect()
+                .with_columns(pl.lit("CpG").alias("context"))
+            )
+
+        for row in agg.iter_rows(named=True):
+            ctx = row.get("context", "CpG")
+            if contexts and ctx not in contexts:
+                continue
+            total_cov = row["total_cov"]
+            total_meth = row["total_meth"]
+            rows.append(
+                {
+                    "sample": sample,
+                    "context": ctx,
+                    "n_sites": row["n_sites"],
+                    "global_methylation": (total_meth / total_cov)
+                    if total_cov > 0
+                    else float("nan"),
+                }
+            )
+
+    if not rows:
+        return pl.DataFrame(
+            {
+                "sample": pl.Series([], dtype=pl.Utf8),
+                "context": pl.Series([], dtype=pl.Utf8),
+                "n_sites": pl.Series([], dtype=pl.Int64),
+                "global_methylation": pl.Series([], dtype=pl.Float64),
+                "is_outlier": pl.Series([], dtype=pl.Boolean),
+            }
+        )
+
+    result = pl.DataFrame(rows)
+
+    # --- Outlier detection (MAD, per context) ---
+    outlier_flags = np.zeros(len(result), dtype=bool)
+
+    for ctx in result["context"].unique().to_list():
+        ctx_mask = (result["context"] == ctx).to_numpy()
+        meth_vals = result.filter(pl.col("context") == ctx)["global_methylation"].to_numpy()
+        valid = ~np.isnan(meth_vals)
+
+        if valid.sum() < 3:
+            continue
+
+        median = float(np.median(meth_vals[valid]))
+        mad = float(np.median(np.abs(meth_vals[valid] - median)))
+
+        if mad == 0:
+            continue
+
+        z_scores = np.abs(meth_vals - median) / (1.4826 * mad)
+        ctx_outliers = (z_scores > 3.0) & valid
+        outlier_flags[ctx_mask] = ctx_outliers
+
+        n_outliers = int(ctx_outliers.sum())
+        if n_outliers:
+            logger.warning(
+                "global_methylation_report: %d outlier sample(s) detected "
+                "in context %s (MAD threshold 3sigma)",
+                n_outliers,
+                ctx,
+            )
+
+    return result.with_columns(pl.Series("is_outlier", outlier_flags, dtype=pl.Boolean)).sort(
+        ["context", "sample"]
+    )
+
+
+def coverage_uniformity(
+    methylstore_path: str,
+    sample: str,
+    thresholds: list[int] | None = None,
+) -> pl.DataFrame:
+    """Compute per-chromosome coverage breadth statistics for one sample.
+
+    Reports the fraction of CpG sites covered at each threshold depth and
+    flags chromosomes (and the sample overall) when coverage breadth at 1x
+    falls below 80 %.
+
+    Parameters
+    ----------
+    methylstore_path : str
+        Path to the partitioned Parquet methylstore.
+    sample : str
+        Sample identifier.
+    thresholds : list[int], optional
+        Coverage depth thresholds to report (default: [1, 5, 10]).
+
+    Returns
+    -------
+    pl.DataFrame
+        Columns: sample (Utf8), chrom (Utf8),
+                 n_sites (Int64), mean_coverage (Float64),
+                 frac_ge_1x (Float64), frac_ge_5x (Float64),
+                 frac_ge_10x (Float64),   [one per threshold]
+                 low_coverage_flag (bool).
+        The final row has chrom="genome" and reports genome-wide aggregates.
+    """
+    if thresholds is None:
+        thresholds = [1, 5, 10]
+
+    store = Path(methylstore_path)
+    sample_dir = store / f"sample={sample}"
+
+    if not sample_dir.exists():
+        raise ValueError(f"Sample '{sample}' not found in methylstore: {sample_dir}")
+
+    chrom_rows: list[dict] = []
+
+    for chrom_dir in sorted(sample_dir.glob("chrom=*")):
+        chrom = chrom_dir.name.removeprefix("chrom=")
+        parts = list(chrom_dir.glob("part-*.parquet"))
+        if not parts:
+            continue
+
+        cov_series = pl.concat(
+            [pl.read_parquet(str(p), columns=["coverage"])["coverage"] for p in parts]
+        )
+
+        n = len(cov_series)
+        cov_arr = cov_series.to_numpy()
+        row: dict = {
+            "sample": sample,
+            "chrom": chrom,
+            "n_sites": n,
+            "mean_coverage": float(cov_arr.mean()) if n > 0 else float("nan"),
+        }
+
+        for t in thresholds:
+            key = f"frac_ge_{t}x"
+            row[key] = float((cov_arr >= t).sum() / n) if n > 0 else float("nan")
+
+        frac_1x = row.get("frac_ge_1x", float("nan"))
+        row["low_coverage_flag"] = (not np.isnan(frac_1x)) and (
+            frac_1x < _MIN_GENOME_COVERAGE_FRACTION
+        )
+
+        chrom_rows.append(row)
+
+        if row["low_coverage_flag"]:
+            logger.warning(
+                "Sample '%s', %s: only %.1f %% of sites covered at >=1x (threshold: %.0f %%)",
+                sample,
+                chrom,
+                frac_1x * 100,
+                _MIN_GENOME_COVERAGE_FRACTION * 100,
+            )
+
+    if not chrom_rows:
+        raise ValueError(f"No chromosome data found for sample '{sample}'")
+
+    # --- Genome-wide aggregate row ---
+    total_n = sum(r["n_sites"] for r in chrom_rows)
+    genome_row: dict = {
+        "sample": sample,
+        "chrom": "genome",
+        "n_sites": total_n,
+        # Site-weighted (consistent with the frac_ge_Tx aggregates below):
+        # an unweighted mean of per-chromosome means lets a tiny
+        # high-coverage contig skew the genome figure.
+        "mean_coverage": float(
+            sum(
+                r["mean_coverage"] * r["n_sites"]
+                for r in chrom_rows
+                if not np.isnan(r["mean_coverage"])
+            )
+            / total_n
+        )
+        if total_n > 0
+        else float("nan"),
+    }
+    for t in thresholds:
+        key = f"frac_ge_{t}x"
+        values = [r[key] * r["n_sites"] for r in chrom_rows if key in r and not np.isnan(r[key])]
+        genome_row[key] = (sum(values) / total_n) if total_n > 0 else float("nan")
+
+    frac_1x_genome = genome_row.get("frac_ge_1x", float("nan"))
+    genome_row["low_coverage_flag"] = (not np.isnan(frac_1x_genome)) and (
+        frac_1x_genome < _MIN_GENOME_COVERAGE_FRACTION
+    )
+    chrom_rows.append(genome_row)
+
+    # Build schema dynamically based on requested thresholds
+    schema_extras: dict = {f"frac_ge_{t}x": pl.Float64 for t in thresholds}
+    result = pl.DataFrame(chrom_rows).cast(
+        {
+            "n_sites": pl.Int64,
+            **schema_extras,
+        }
+    )
+
+    return result.sort(["chrom"])
+
+
+# Clinical / cohort QC pack
+
+
+def _resolve_x_chrom_dir(store: Path, sample: str) -> Path | None:
+    """Find the X-chromosome partition for a sample under any naming."""
+    for name in _X_CHROM_NAMES:
+        d = store / f"sample={sample}" / f"chrom={name}"
+        if d.exists():
+            return d
+    return None
+
+
+def _classify_sex_from_values(
+    sample_ids: list[str],
+    values: np.ndarray,
+    *,
+    fixed_threshold: float = 0.25,
+    dip_p_threshold: float = 0.10,
+) -> dict[str, str | None]:
+    """Classify sex from per-sample mean chrX beta values.
+
+    Uses 1D largest-gap clustering (KMeans-2 approximation). When the
+    distribution is unimodal according to Hartigan's dip test (p >
+    *dip_p_threshold*), the clustering is skipped and each sample is
+    classified against the fixed *fixed_threshold* with a UserWarning.
+
+    Parameters
+    ----------
+    sample_ids
+        Sample identifiers, aligned with *values*.
+    values
+        Per-sample mean chrX beta (finite values only).
+    fixed_threshold
+        Beta cut-off used when dip-test indicates unimodality.
+    dip_p_threshold
+        Dip-test p-value above which unimodality is assumed.
+
+    Returns
+    -------
+    dict mapping each sample_id to ``"male"`` / ``"female"`` or ``None``.
+    """
+    import warnings
+
+    if len(values) == 0:
+        return {sid: None for sid in sample_ids}
+
+    if len(values) >= 2:
+        # Gate clustering on Hartigan's dip test.
+        _use_cluster = True
+        try:
+            import diptest  # optional extra
+
+            _dip_stat, dip_p = diptest.diptest(np.asarray(values, dtype=float))
+            if dip_p > dip_p_threshold:
+                warnings.warn(
+                    f"single-sex cohort detected (Hartigan dip test p={dip_p:.3f}); "
+                    f"sex inferred from chrX-beta fixed threshold ({fixed_threshold}) only.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+                _use_cluster = False
+        except ImportError:
+            pass  # diptest not installed; proceed with clustering
+
+        if _use_cluster:
+            # 1D kmeans-2: sort and find the largest gap; assign two clusters.
+            sorted_vals = np.sort(values)
+            gaps = np.diff(sorted_vals)
+            cut_idx = int(np.argmax(gaps)) + 1
+            cut = (sorted_vals[cut_idx - 1] + sorted_vals[cut_idx]) / 2.0
+        else:
+            cut = fixed_threshold
+    else:
+        cut = fixed_threshold  # single sample: fixed fallback
+
+    return {
+        sid: ("male" if v < cut else "female") for sid, v in zip(sample_ids, values, strict=False)
+    }
+
+
+def sex_check(
+    methylstore_path: str,
+    samples: list[str],
+    *,
+    min_coverage: int = 5,
+    expected_sex: dict[str, str] | None = None,
+) -> pl.DataFrame:
+    """Infer sample sex from mean beta on the X chromosome .
+
+    Female samples carry one inactivated X and have mean(beta) ~= 0.4 - 0.5
+    on the X chromosome; male samples have mean(beta) ~= 0.05 - 0.10. We
+    classify each sample by kmeans-2 on the per-sample mean-chrX-beta values
+    (lower cluster -> male, upper cluster -> female). When fewer than two
+    samples are usable the call falls back to a fixed threshold of 0.25.
+
+    Parameters
+    ----------
+    methylstore_path
+        Path to the partitioned Parquet methylstore.
+    samples
+        Sample IDs to assess. Samples missing chrX data are reported
+        with ``inferred_sex == None``.
+    min_coverage
+        Minimum coverage at a CpG before it counts toward the mean.
+    expected_sex
+        Optional dict ``{sample_id: "male" | "female"}``. When supplied,
+        any inferred sex that differs from the expected value is flagged
+        ``mismatch=True``.
+
+    Returns
+    -------
+    pl.DataFrame with columns
+        sample_id, mean_chrx_beta, inferred_sex, expected_sex, mismatch.
+    """
+    store = Path(methylstore_path)
+    records: list[dict] = []
+    for sample in samples:
+        x_dir = _resolve_x_chrom_dir(store, sample)
+        if x_dir is None:
+            records.append(
+                {
+                    "sample_id": sample,
+                    "mean_chrx_beta": float("nan"),
+                    "inferred_sex": None,
+                    "expected_sex": (expected_sex or {}).get(sample),
+                    "mismatch": False,
+                }
+            )
+            continue
+        try:
+            part = next(x_dir.glob("part-*.parquet"))
+        except StopIteration:
+            records.append(
+                {
+                    "sample_id": sample,
+                    "mean_chrx_beta": float("nan"),
+                    "inferred_sex": None,
+                    "expected_sex": (expected_sex or {}).get(sample),
+                    "mismatch": False,
+                }
+            )
+            continue
+        df = pl.read_parquet(str(part), columns=["N_meth", "coverage"]).filter(
+            pl.col("coverage") >= min_coverage
+        )
+        if len(df) == 0:
+            mean_beta = float("nan")
+        else:
+            tot_meth = int(df.get_column("N_meth").sum())
+            tot_cov = int(df.get_column("coverage").sum())
+            mean_beta = tot_meth / max(tot_cov, 1)
+        records.append(
+            {
+                "sample_id": sample,
+                "mean_chrx_beta": float(mean_beta),
+                "inferred_sex": None,
+                "expected_sex": (expected_sex or {}).get(sample),
+                "mismatch": False,
+            }
+        )
+
+    # KMeans-2 classification on the available mean_chrx_beta values.
+    values = np.array(
+        [r["mean_chrx_beta"] for r in records if np.isfinite(r["mean_chrx_beta"])],
+        dtype=np.float64,
+    )
+    valid_samples = [r["sample_id"] for r in records if np.isfinite(r["mean_chrx_beta"])]
+    sex_map = _classify_sex_from_values(valid_samples, values)
+
+    for r in records:
+        r["inferred_sex"] = sex_map.get(r["sample_id"])
+        exp = r.get("expected_sex")
+        r["mismatch"] = bool(
+            exp is not None and r["inferred_sex"] is not None and r["inferred_sex"] != exp
+        )
+
+    return pl.DataFrame(records)
+
+
+def contamination_estimate(
+    methylstore_path: str,
+    sample: str,
+    *,
+    min_coverage: int = 10,
+) -> float:
+    """Fraction of well-covered CpGs with intermediate beta (0.2 < beta < 0.8).
+
+    .. warning::
+        This is an *intermediate-beta fraction*, NOT a validated contamination
+        estimate, and it is heavily confounded by biology. Intermediate beta
+        is produced by cell-type heterogeneity in bulk tissue, allele-specific
+        methylation, imprinting, and copy-number variation -- none of which is
+        contamination. A heterogeneous-but-clean tissue scores high; a
+        contaminated homogeneous sample may score low. The score is not
+        calibrated against spike-in contamination titrations and is not
+        comparable across tissues. For a genuine contamination estimate, use a
+        genotype/SNP-VAF-bimodality method validated against known mixtures.
+        Treat this as a coarse, tissue-specific QC flag only.
+
+    Clean, *homogeneous* WGBS samples have a strongly bimodal beta distribution
+    (most CpGs near 0 or 1); cross-sample contamination is one of several
+    things that adds intermediate-beta mass.
+
+    Parameters
+    ----------
+    methylstore_path : str
+        Partitioned Parquet methylstore root.
+    sample : str
+        Sample ID.
+    min_coverage : int
+        Minimum per-CpG coverage to count.
+
+    Returns
+    -------
+    float
+        Contamination score in ``[0, 1]``. Higher values are more
+        suspicious; thresholds around 0.15 - 0.25 are typical alert
+        levels but the right threshold is cohort-specific.
+    """
+    store = Path(methylstore_path)
+    sample_dir = store / f"sample={sample}"
+    if not sample_dir.exists():
+        return float("nan")
+    parts = list(sample_dir.glob("chrom=*/part-*.parquet"))
+    if not parts:
+        return float("nan")
+    n_total = 0
+    n_mid = 0
+    for part in parts:
+        df = pl.read_parquet(str(part), columns=["N_meth", "coverage"]).filter(
+            pl.col("coverage") >= min_coverage
+        )
+        if len(df) == 0:
+            continue
+        meth = df.get_column("N_meth").to_numpy().astype(np.float64)
+        cov = df.get_column("coverage").to_numpy().astype(np.float64)
+        beta = meth / np.maximum(cov, 1.0)
+        n_total += len(beta)
+        n_mid += int(((beta > 0.2) & (beta < 0.8)).sum())
+    if n_total == 0:
+        return float("nan")
+    return float(n_mid) / float(n_total)
+
+
+def sample_correlation(
+    methylstore_path: str,
+    samples: list[str],
+    *,
+    method: str = "spearman",
+    min_coverage: int = 10,
+    chromosomes: list[str] | None = None,
+    max_sites: int = 200_000,
+) -> pl.DataFrame:
+    """Pairwise sample-vs-sample beta correlation matrix .
+
+    Builds the per-sample beta vector over the intersection of CpGs covered
+    at ``min_coverage`` in every sample, then returns the
+    ``(n_samples x n_samples)`` correlation matrix as a long-form
+    DataFrame.
+
+    Parameters
+    ----------
+    method : {"spearman", "pearson"}
+        Correlation type.
+    min_coverage : int
+        Minimum per-sample coverage to include a CpG in the correlation
+        basis.
+    chromosomes : list[str], optional
+        Restrict to these chromosomes. Auto-detected when None.
+    max_sites : int
+        Cap the correlation basis at a deterministic random panel of this
+        many intersected CpGs (default 200k). Sample-vs-sample correlation
+        is stable on a large random panel, so this keeps the dense matrix
+        and the Spearman rank copy from scaling to genome size (~GBs at
+        22M CpGs). Set to 0 to use every intersected CpG.
+
+    Returns
+    -------
+    pl.DataFrame with one row per (sample_a, sample_b) pair and a
+    ``correlation`` column. The full matrix is also addressable via
+    ``df.pivot(...)``.
+    """
+    if method not in ("spearman", "pearson"):
+        raise ValueError("method must be 'spearman' or 'pearson'")
+    store = Path(methylstore_path)
+    if chromosomes is None:
+        chroms: set[str] = set()
+        for s_dir in store.glob("sample=*"):
+            for c_dir in s_dir.glob("chrom=*"):
+                chroms.add(c_dir.name.removeprefix("chrom="))
+        chromosomes = sorted(chroms)
+
+    # Build streaming intersection and accumulate per-sample beta vectors.
+    beta_chunks: dict[str, list[np.ndarray]] = {s: [] for s in samples}
+    for chrom in chromosomes:
+        per_sample_dfs: list[pl.DataFrame] = []
+        for s in samples:
+            part = store / f"sample={s}" / f"chrom={chrom}" / "part-0.parquet"
+            if not part.exists():
+                per_sample_dfs = []
+                break
+            d = pl.read_parquet(str(part), columns=["pos", "N_meth", "coverage"]).filter(
+                pl.col("coverage") >= min_coverage
+            )
+            d = d.with_columns(
+                (pl.col("N_meth") / pl.col("coverage")).alias(f"beta_{s}"),
+            ).select(["pos", f"beta_{s}"])
+            per_sample_dfs.append(d)
+        if not per_sample_dfs:
+            continue
+        joined = per_sample_dfs[0]
+        for d in per_sample_dfs[1:]:
+            joined = joined.join(d, on="pos", how="inner")
+        if len(joined) == 0:
+            continue
+        for s in samples:
+            beta_chunks[s].append(joined.get_column(f"beta_{s}").to_numpy())
+
+    if not any(beta_chunks.values()):
+        return pl.DataFrame(
+            {
+                "sample_a": [],
+                "sample_b": [],
+                "correlation": [],
+            }
+        )
+
+    beta_matrix = np.column_stack(
+        [np.concatenate(beta_chunks[s]) for s in samples]
+    )  # shape (n_sites_intersection, n_samples)
+    del beta_chunks
+
+    n_total = beta_matrix.shape[0]
+    if max_sites and n_total > max_sites:
+        # Deterministic random panel (fixed seed) so the dense matrix and the
+        # spearman rank copy stay bounded regardless of genome size.
+        rng = np.random.default_rng(0)
+        idx = np.sort(rng.choice(n_total, size=max_sites, replace=False))
+        beta_matrix = beta_matrix[idx]
+        logger.info(
+            "sample_correlation: using a random %s-CpG panel of %s "
+            "intersected CpGs (max_sites; seed=0) to bound memory.",
+            f"{max_sites:,}",
+            f"{n_total:,}",
+        )
+
+    if method == "spearman":
+        from scipy import stats as sp_stats
+
+        corr = sp_stats.spearmanr(beta_matrix).statistic
+        # spearmanr returns either a scalar (n=2) or a matrix.
+        if np.ndim(corr) == 0:
+            corr = np.array([[1.0, float(corr)], [float(corr), 1.0]])
+    else:
+        corr = np.corrcoef(beta_matrix, rowvar=False)
+
+    rows = []
+    for i, sa in enumerate(samples):
+        for j, sb in enumerate(samples):
+            rows.append(
+                {
+                    "sample_a": sa,
+                    "sample_b": sb,
+                    "correlation": float(corr[i, j]),
+                }
+            )
+    return pl.DataFrame(rows)
+
+
+def power(
+    meth_diff: float,
+    coverage: float,
+    n_per_group: int | None = None,
+    *,
+    power: float | None = None,
+    alpha: float = 0.05,
+    baseline_beta: float = 0.5,
+    replicate_sd: float = 0.05,
+    dispersion: float = 1.0,
+    n_tests: int | None = None,
+    two_sided: bool = True,
+) -> float | int:
+    """Methylation-specific power / sample-size calculator (two-sample t-test).
+
+    Models beta at each replicate as binomial sampling noise (variance
+    ``dispersion * beta(1-beta)/coverage`` per replicate per CpG) plus
+    between-replicate biological variance ``replicate_sd^2``. The per-replicate
+    SD is ``sd_single = sqrt(dispersion*beta(1-beta)/coverage + replicate_sd^2)``
+    and the standardized effect (Cohen's d) is ``meth_diff / sd_single``. Power
+    is the exact two-sample t-test power: non-central t with ``df = 2(n-1)`` and
+    non-centrality ``d * sqrt(n/2)``, evaluated at the (optionally
+    multiple-testing-adjusted) critical value.
+
+    This corrects three sources of over-optimism in a naive binomial z-test:
+
+    * **t, not z** -- at small n (the solver returns n >= 2) the critical value
+      is the Student-t quantile (t(df=2) ~ 4.30 at n=2), not 1.96.
+    * **overdispersion** -- real WGBS is overdispersed (phi ~ 1.5-5); the
+      binomial-only default (``dispersion=1.0``) understates the per-replicate
+      variance. Set ``dispersion`` to your estimated phi for honest planning.
+    * **multiple testing** -- a genome-wide scan tests millions of CpGs. Pass
+      ``n_tests`` to use a Bonferroni-adjusted per-test alpha (``alpha/n_tests``);
+      the default ``None`` is single-locus and is optimistic for genome-wide use.
+
+    When ``n_per_group`` is supplied (default mode), returns the implied power.
+    When ``power=...`` is supplied instead, returns the smallest ``n_per_group``
+    (integer, >= 2) achieving that target power.
+
+    Parameters
+    ----------
+    meth_diff : float
+        Expected effect size Deltabeta (e.g. 0.10 = 10 percentage points).
+    coverage : float
+        Mean per-CpG coverage. Must be > 0.
+    n_per_group : int, optional
+        Sample size per group; pass this to return power.
+    power : float, optional
+        Target power (e.g. 0.80); pass this to return sample size.
+    alpha : float
+        Per-test significance level before any multiple-testing adjustment
+        (default 0.05).
+    baseline_beta : float
+        Reference methylation level (default 0.5 = worst case for binomial
+        variance).
+    replicate_sd : float
+        Between-replicate biological SD.
+    dispersion : float
+        Overdispersion multiplier (phi) on the binomial variance term. 1.0 =
+        binomial (optimistic); real WGBS is typically 1.5-5.
+    n_tests : int, optional
+        Number of CpGs tested genome-wide. When set, the effective per-test
+        alpha is ``alpha / n_tests`` (Bonferroni). Default None = single locus.
+    two_sided : bool
+        Use the two-sided critical value.
+
+    Returns
+    -------
+    float (power) or int (n_per_group), depending on which knob was set.
+    """
+    from scipy import stats as sp_stats
+
+    if (n_per_group is None) == (power is None):
+        raise ValueError("Pass exactly one of n_per_group, power.")
+    if coverage <= 0:
+        raise ValueError(f"coverage must be > 0, got {coverage}")
+    eff_alpha = alpha / n_tests if n_tests else alpha
+    sd_single = float(
+        np.sqrt(dispersion * baseline_beta * (1.0 - baseline_beta) / coverage + replicate_sd**2)
+    )
+    d = abs(meth_diff) / max(sd_single, 1e-12)  # Cohen's d (per-replicate)
+
+    def _power_at_n(n: int) -> float:
+        if n < 2:
+            return 0.0
+        df = 2 * (n - 1)
+        ncp = d * float(np.sqrt(n / 2.0))
+        t_crit = float(sp_stats.t.isf(eff_alpha / 2.0 if two_sided else eff_alpha, df))
+        pwr = float(sp_stats.nct.sf(t_crit, df, ncp))
+        if two_sided:
+            pwr += float(sp_stats.nct.cdf(-t_crit, df, ncp))
+        return min(max(pwr, 0.0), 1.0)
+
+    if n_per_group is not None:
+        return _power_at_n(int(n_per_group))
+
+    # Solve for the minimum n that achieves the target power.
+    target = float(power)
+    for n in range(2, 10_001):
+        if _power_at_n(n) >= target:
+            return n
+    return 10_000

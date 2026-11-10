@@ -1,0 +1,1132 @@
+"""Vectorised binomial GLM for covariate-aware methylation testing.
+
+This module provides the engine for ``test="glm"`` in the DMC/DMR pipeline.
+It fits one binomial logistic GLM per site (or per tile) on a *shared*
+design matrix derived from ``md.obs``, then exposes the per-site deviance
+and Pearson chi-squared so the caller can run a deviance LR test of the
+full design against a reduced design with the treatment column removed.
+
+The implementation is a single-pass batched IRLS:
+
+    eta_ij  = X_j * beta_i              # linear predictor at site i, sample j
+    mu_ij   = sigmoid(eta_ij)
+    w_ij    = n_ij * mu_ij * (1 - mu_ij) # binomial GLM weight (cov = trials)
+    z_ij    = eta_ij + (y_ij/n_ij - mu_ij) / (mu_ij * (1 - mu_ij))
+    beta_i  = (X' W_i X)^{-1} X' W_i z_i
+
+At each iteration we build normal equations for active sites via
+``np.einsum`` and solve finite batches while isolating singular systems.
+With p <= 6 and tile-level n_sites ~ 10^4 to 10^5, the whole IRLS converges
+in well under a second.
+
+The hot path deliberately avoids ``statsmodels`` so we don't pay per-site
+Python overhead. ``patsy`` is used only once at design-matrix construction
+time (a tiny up-front cost).
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Sequence
+from typing import Any, Literal, overload
+
+import numpy as np
+import polars as pl
+
+logger = logging.getLogger(__name__)
+
+_EPS = 1e-9
+_PROP_CLIP = 1e-6
+GLM_ALGORITHM_REVISION = "binomial-irls-estimable-active-v1"
+
+
+# Design matrix construction
+
+
+@overload
+def build_design(
+    obs: pl.DataFrame,
+    samples_ordered: Sequence[str],
+    formula: str | None = ...,
+    covariates: Sequence[str] | None = ...,
+    treatment_col: str = ...,
+    require_treatment_col: bool = ...,
+    return_design_info: Literal[False] = ...,
+    reference_level: str | None = ...,
+) -> tuple[np.ndarray, np.ndarray | None, int, list[str], str]: ...
+
+
+@overload
+def build_design(
+    obs: pl.DataFrame,
+    samples_ordered: Sequence[str],
+    formula: str | None = ...,
+    covariates: Sequence[str] | None = ...,
+    treatment_col: str = ...,
+    require_treatment_col: bool = ...,
+    *,
+    return_design_info: Literal[True],
+    reference_level: str | None = ...,
+) -> tuple[np.ndarray, np.ndarray | None, int, list[str], str, Any]: ...
+
+
+def build_design(
+    obs: pl.DataFrame,
+    samples_ordered: Sequence[str],
+    formula: str | None = None,
+    covariates: Sequence[str] | None = None,
+    treatment_col: str = "treatment",
+    require_treatment_col: bool = True,
+    return_design_info: bool = False,
+    reference_level: str | None = None,
+) -> (
+    tuple[np.ndarray, np.ndarray | None, int, list[str], str]
+    | tuple[np.ndarray, np.ndarray | None, int, list[str], str, Any]
+):
+    """Build full + reduced model matrices from ``md.obs``.
+
+    Parameters
+    ----------
+    obs
+        ``md.obs`` polars DataFrame. Must contain ``sample_id`` and every
+        column referenced by ``formula`` / ``covariates``.
+    samples_ordered
+        Sample ids in the exact order the DMC/DMR engine will load them
+        (case ids first, then control ids). Rows of the returned design
+        matrices follow this order.
+    formula
+        patsy formula string, e.g. ``"~ treatment + age + donor"``. The
+        leading tilde is optional. If ``None`` it is synthesised from
+        ``treatment_col`` and ``covariates``.
+    covariates
+        Convenience list of column names. Combined with ``formula`` by
+        appending any name not already present.
+    treatment_col
+        Name of the binary 0/1 treatment column in ``obs``. The reduced
+        design drops exactly this column from the full design; that single
+        coefficient is the contrast tested by the deviance LR test.
+    require_treatment_col
+        When True (default, backwards-compatible) the function enforces
+        that ``treatment_col`` is present and produces a reduced design
+        with that column dropped. When False (used by the multi-group /
+        contrast path in :func:`tl.dmc`), the reduced design is set to
+        ``None`` and ``coef_idx`` becomes ``-1`` -- the caller is expected
+        to use :func:`wald_test` against a contrast matrix instead of a
+        full-vs-reduced deviance test.
+    return_design_info
+        When True, the function returns a 6-tuple with the patsy
+        ``DesignInfo`` object appended. Allows callers to resolve
+        contrast strings via :func:`resolve_contrast`.
+    reference_level
+        When set, the *first* term in the (possibly synthesised) formula
+        that matches a column present in ``obs`` as a string/categorical
+        dtype is wrapped as ``C(col, Treatment(reference='level'))``.
+        This overrides patsy's default alphabetical reference level.
+        Pass ``None`` (default) to preserve the existing behaviour.
+
+    Returns
+    -------
+    X_full        (n_samples, p)        full design matrix
+    X_reduced     (n_samples, p - 1)    X_full with the treatment column removed
+    coef_idx      column index of treatment in X_full
+    term_names    column names from patsy (length p)
+    formula_used  the formula actually fitted, after merging covariates
+    """
+    if require_treatment_col and treatment_col not in obs.columns:
+        raise ValueError(
+            f"Treatment column '{treatment_col}' not found in md.obs. Available: {obs.columns}"
+        )
+
+    # ---- Synthesise / normalise the formula --------------------------------
+    terms: list[str] = []
+    if formula is not None:
+        rhs = formula.strip()
+        if rhs.startswith("~"):
+            rhs = rhs[1:].strip()
+        # split on '+' but keep interactions ('a:b') and transforms intact
+        for term in rhs.split("+"):
+            t = term.strip()
+            if t and t not in terms:
+                terms.append(t)
+
+    if covariates:
+        for c in covariates:
+            if c not in terms:
+                terms.append(c)
+
+    if require_treatment_col and treatment_col not in terms:
+        terms.insert(0, treatment_col)
+
+    if not terms:
+        raise ValueError(
+            "Empty formula. Pass a non-empty `formula=` or `covariates=` "
+            "(or use the default binary path with a treatment column on md.obs)."
+        )
+
+    # ---- Apply reference_level via patsy Treatment coding ------------------
+    if reference_level is not None:
+        # Find the first term that (a) corresponds to a column in obs and
+        # (b) has a string/categorical dtype -- i.e. a genuine factor for
+        # which setting the reference level makes sense.
+        obs_str_cols: set[str] = {
+            c
+            for c, d in zip(obs.columns, obs.dtypes, strict=True)
+            if d in (pl.Utf8, pl.Categorical, pl.String)
+        }
+        wrapped_terms: list[str] = []
+        _did_wrap = False
+        for term in terms:
+            # Only wrap simple column names (no interaction ':' or transforms).
+            if not _did_wrap and term in obs_str_cols and ":" not in term:
+                term = f"C({term}, Treatment(reference='{reference_level}'))"
+                _did_wrap = True
+            wrapped_terms.append(term)
+        if not _did_wrap:
+            logger.warning(
+                "build_design: reference_level=%r was specified but no "
+                "string/categorical column matching a formula term was found "
+                "in obs (terms=%r). reference_level has no effect.",
+                reference_level,
+                terms,
+            )
+        terms = wrapped_terms
+
+    formula_used = "~ " + " + ".join(terms)
+
+    # ---- Reorder obs rows to samples_ordered -------------------------------
+    obs_pd = obs.to_pandas().set_index("sample_id")
+    missing = [s for s in samples_ordered if s not in obs_pd.index]
+    if missing:
+        raise ValueError(f"Samples missing from md.obs: {missing}")
+    obs_pd = obs_pd.loc[list(samples_ordered)]
+
+    # ---- Validate covariate columns are present and complete ----------------
+    referenced_cols: set[str] = set()
+    for term in terms:
+        for tok in term.replace(":", " ").replace("*", " ").split():
+            tok = tok.strip("()")
+            if tok in obs_pd.columns:
+                referenced_cols.add(tok)
+    for col in referenced_cols:
+        nulls = obs_pd[col].isna()
+        if nulls.any():
+            bad = obs_pd.index[nulls].tolist()
+            raise ValueError(
+                f"Column '{col}' has missing values for samples {bad}. "
+                "Drop or impute these samples before calling the GLM."
+            )
+
+    # ---- Build design matrix via patsy --------------------------------------
+    try:
+        import patsy
+    except ImportError as e:  # pragma: no cover - patsy ships with statsmodels
+        raise ImportError(
+            "patsy is required for covariate-aware DMR. It ships with "
+            "statsmodels, which is already in epykit's dependencies."
+        ) from e
+
+    X_design = patsy.dmatrix(formula_used, data=obs_pd, return_type="matrix")
+    X_full = np.asarray(X_design, dtype=np.float64)
+    design_info = X_design.design_info
+    term_names: list[str] = list(design_info.column_names)
+
+    logger.info(
+        "build_design: columns=%s reference_level=%r",
+        term_names,
+        reference_level,
+    )
+
+    n_samples, p_full = X_full.shape
+    if p_full >= n_samples:
+        raise ValueError(
+            f"Too many covariates: design has p={p_full} parameters but "
+            f"only n_samples={n_samples}. Add more samples or drop "
+            "covariates before fitting."
+        )
+
+    if require_treatment_col:
+        if treatment_col not in term_names:
+            raise ValueError(
+                f"Treatment column '{treatment_col}' did not appear as a column "
+                f"in the resulting design matrix (got {term_names}). It must be "
+                "numeric (0/1) so patsy keeps its name verbatim."
+            )
+        coef_idx = term_names.index(treatment_col)
+        if p_full < 2:
+            raise ValueError(
+                "Design must contain at least the intercept and the treatment "
+                "column (p >= 2). Did you pass '~0 + ...'?"
+            )
+        # ---- Reduced design: drop the treatment column ----------------------
+        X_reduced = np.delete(X_full, coef_idx, axis=1)
+    else:
+        coef_idx = -1
+        X_reduced = None
+
+    if return_design_info:
+        return X_full, X_reduced, coef_idx, term_names, formula_used, design_info
+    return X_full, X_reduced, coef_idx, term_names, formula_used
+
+
+# Batched IRLS for the binomial GLM
+
+
+def irls_dispatch(
+    meth: np.ndarray,
+    cov: np.ndarray,
+    X: np.ndarray,
+    *,
+    backend: str = "cpu",
+    **kwargs,
+):
+    """Dispatch IRLS to the CPU (default) or GPU backend.
+
+    ``backend="cpu"`` calls :func:`irls_binomial_batch` directly -- the
+    historical, default path. ``backend="gpu"`` imports
+    :mod:`epykit._glm_gpu` lazily and routes through CuPy. Both return
+    the same shapes and dtypes; downstream code is GPU-agnostic.
+
+    Anything other than ``"cpu"`` / ``"gpu"`` raises ``ValueError``.
+    """
+    backend = (backend or "cpu").lower()
+    if backend == "cpu":
+        return irls_binomial_batch(meth, cov, X, **kwargs)
+    raise ValueError(f"Unknown glm_backend {backend!r}. Only 'cpu' is supported in minimal build.")
+
+
+def irls_binomial_batch(
+    meth: np.ndarray,
+    cov: np.ndarray,
+    X: np.ndarray,
+    max_iter: int = 25,
+    tol: float = 1e-6,
+    return_cov: bool = False,
+) -> (
+    tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+):
+    """Batched IRLS for binomial GLMs sharing a design matrix.
+
+    Fits one independent GLM per row (= per site / tile) where the response
+    is ``meth_ij`` successes out of ``cov_ij`` trials at sample j, modelled
+    as ``logit(mu_ij) = X_j * beta_i``.
+
+    Parameters
+    ----------
+    meth      (n_sites, n_samples) int32   methylated read counts
+    cov       (n_sites, n_samples) int32   total read counts (= weights)
+    X         (n_samples, p)       float   design matrix (shared across sites)
+    max_iter, tol
+        IRLS convergence controls. ``tol`` applies to the max-norm of
+        ``beta - beta_prev``.
+    return_cov
+        When True, append the per-site covariance matrix
+        ``cov_beta`` (shape ``(n_sites, p, p)``) to the return tuple as a
+        sixth element. Used by :func:`wald_test` for joint / multi-row
+        contrasts. Existing five-element callers stay unchanged.
+
+    Returns
+    -------
+    beta            (n_sites, p)        fitted coefficients
+    se_beta         (n_sites, p)        sqrt(diag((X' W X)^{-1})) at convergence
+    deviance        (n_sites,)          -2 logL at the fitted mu (binomial)
+    pearson_chi2    (n_sites,)          Sigma_j (y - n mu)^2 / (n mu (1-mu))
+    n_eff           (n_sites,)          number of samples with cov > 0
+    cov_beta        (n_sites, p, p)     OPTIONAL, only when return_cov=True
+
+    Sites where the IRLS hit logistic-regression separation (any covered
+    sample's eta reached the +/-30 clip bound) are NaN'd in ``deviance``,
+    ``pearson_chi2``, ``beta`` and ``se_beta``. This is required for a
+    sane Pearson dispersion: without it the Pearson denominator
+    ``n * mu * (1 - mu)`` collapses to ``n * _PROP_CLIP`` at saturated
+    samples and per-site chi-sq blows up by ~6 OOM.
+    """
+    n_sites, n_samples = meth.shape
+    p = X.shape[1]
+    if X.shape[0] != n_samples:
+        raise ValueError(
+            f"Design matrix has {X.shape[0]} rows but there are "
+            f"{n_samples} samples; rows must match number of samples."
+        )
+
+    cov_f = cov.astype(np.float64, copy=False)
+    meth_f = meth.astype(np.float64, copy=False)
+    has_cov = cov_f > 0
+    n_eff = has_cov.sum(axis=1).astype(np.int32)
+
+    # ---- Initialise beta from per-site clipped logit proportions -----------
+    # Use a single round of weighted least squares on the logit of the
+    # clipped sample proportions. Samples with zero coverage contribute zero
+    # weight so they fall out of the init naturally.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        prop_raw = np.where(has_cov, meth_f / np.maximum(cov_f, 1.0), 0.5)
+    prop_init = np.clip(prop_raw, _PROP_CLIP, 1.0 - _PROP_CLIP)
+    z_init = np.log(prop_init / (1.0 - prop_init))  # (n_sites, n_samples)
+    # weights for init: coverage (mass) only where covered
+    w_init = np.where(has_cov, cov_f, 0.0)
+
+    valid = _estimable_sites(X, has_cov)
+    beta = np.full((n_sites, p), np.nan)
+    beta[valid] = _solve_weighted_lsq(X, z_init[valid], w_init[valid])
+    valid &= np.isfinite(beta).all(axis=1)
+    converged = np.zeros(n_sites, dtype=bool)
+
+    # ---- IRLS iterations: converged coefficients are accepted and frozen. ----
+    for _it in range(max_iter):
+        active = np.flatnonzero(valid & ~converged)
+        if not len(active):
+            break
+        old = beta[active]
+        covered = has_cov[active]
+        depths = cov_f[active]
+        eta = np.clip(old @ X.T, -30.0, 30.0)
+        mu = np.clip(1.0 / (1.0 + np.exp(-eta)), _PROP_CLIP, 1.0 - _PROP_CLIP)
+        var = mu * (1.0 - mu)
+        w = np.where(covered, depths * var, 0.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            adjustment = np.where(covered, (meth_f[active] / np.maximum(depths, 1.0) - mu) / var, 0.0)
+        new = _solve_weighted_lsq(X, eta + adjustment, w)
+        finite = np.isfinite(new).all(axis=1)
+        beta[active] = new
+        valid[active] &= finite
+        converged[active] = finite & (np.max(np.abs(new - old), axis=1) < tol)
+
+    # ---- Final diagnostics (deviance, Pearson chi-sq, SE) ------------------
+    eta_unclipped = beta @ X.T
+
+    # Detect logistic-regression separation: a covered sample whose linear
+    # predictor reached the eta clip bound means the IRLS could not fit a
+    # finite mu there (one stratum is fully methylated / unmethylated). At
+    # those samples the Pearson denominator collapses to n * _PROP_CLIP and
+    # (y - n*mu)^2 / (n * _PROP_CLIP) blows up by ~6 orders of magnitude,
+    # poisoning the chrom-pooled dispersion estimator. Mark separated sites
+    # as degenerate so they (a) drop out of compute_dispersion_phi's
+    # `usable` mask and (b) carry NaN p-values downstream instead of
+    # spurious "significant" calls. We detect separation directly from
+    # the saturated eta rather than relying on a slower convergence-
+    # warning round-trip.
+    SATURATION_THRESHOLD = 29.999  # tiny FP margin below the +/-30 clip
+    separated_per_sample = (np.abs(eta_unclipped) >= SATURATION_THRESHOLD) & has_cov
+    site_separated = separated_per_sample.any(axis=1)
+
+    eta = np.clip(eta_unclipped, -30.0, 30.0)
+    mu = 1.0 / (1.0 + np.exp(-eta))
+    mu = np.clip(mu, _PROP_CLIP, 1.0 - _PROP_CLIP)
+    var = mu * (1.0 - mu)
+
+    # Binomial deviance: 2 * Sigma_j [y log(y/(n mu)) + (n-y) log((n-y)/(n(1-mu)))]
+    # with the convention 0 log 0 = 0. Zero-coverage samples contribute 0.
+    y = meth_f
+    n = cov_f
+    with np.errstate(invalid="ignore", divide="ignore"):
+        n_mu = n * mu
+        n_minus_y = np.maximum(n - y, 0.0)
+        n_one_minus_mu = n * (1.0 - mu)
+        term_a = np.where(
+            (y > 0) & has_cov,
+            y * np.log(np.maximum(y, _EPS) / np.maximum(n_mu, _EPS)),
+            0.0,
+        )
+        term_b = np.where(
+            (n_minus_y > 0) & has_cov,
+            n_minus_y * np.log(np.maximum(n_minus_y, _EPS) / np.maximum(n_one_minus_mu, _EPS)),
+            0.0,
+        )
+    deviance = 2.0 * (term_a + term_b).sum(axis=1)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pearson_per = np.where(
+            has_cov & (var > 0),
+            (y - n_mu) ** 2 / np.maximum(n * var, _EPS),
+            0.0,
+        )
+    pearson_chi2 = pearson_per.sum(axis=1)
+
+    # Standard errors: sqrt(diag((X' W X)^{-1}))
+    w_final = np.where(has_cov, cov_f * var, 0.0)
+    XtWX = np.einsum("jp,ij,jq->ipq", X, w_final, X)
+    se_beta = np.full((n_sites, p), np.nan, dtype=np.float64)
+    cov_beta = np.full((n_sites, p, p), np.nan, dtype=np.float64)
+    identity = np.broadcast_to(np.eye(p), (int(valid.sum()), p, p))
+    cov_beta[valid] = _solve_stacked_systems(XtWX[valid], identity)
+    diag = np.diagonal(cov_beta, axis1=1, axis2=2)
+    se_beta = np.sqrt(np.where(diag > 0, diag, np.nan))
+    valid &= np.isfinite(cov_beta).all(axis=(1, 2)) & np.isfinite(se_beta).all(axis=1)
+    if np.any(~valid):
+        logger.warning("GLM: %d / %d sites have an unidentifiable or unsolved design; inference is NaN",
+                       int((~valid).sum()), n_sites)
+
+    # Sites with no usable data are degenerate. Sites where the GLM
+    # separated (any covered sample's eta hit the clip bound) are also
+    # marked degenerate: the fitted mu there is at the boundary, the
+    # Pearson denominator collapses to n*_PROP_CLIP, and per-site chi-sq
+    # blows up by ~6 OOM (driving chrom-pooled phi from O(1) to O(10^6)
+    # and producing nonsensical p-values).
+    # Non-converged sites are also degenerate: the iterate just before
+    # divergence is unreliable and must not silently emit Wald statistics.
+    site_nonconverged = ~converged
+    degenerate = ~valid | (n_eff < 2) | site_separated | site_nonconverged
+    deviance = np.where(degenerate, np.nan, deviance)
+    pearson_chi2 = np.where(degenerate, np.nan, pearson_chi2)
+    beta = np.where(degenerate[:, None], np.nan, beta)
+    se_beta = np.where(degenerate[:, None], np.nan, se_beta)
+    cov_beta = np.where(degenerate[:, None, None], np.nan, cov_beta)
+
+    n_separated = int(site_separated.sum())
+    if n_separated > 0:
+        # >5 % of sites separated is loud enough to warn the user about
+        # a likely model-specification issue; below that, leave it as an
+        # info-level breadcrumb that doesn't spam normal runs.
+        sep_frac = n_separated / max(n_sites, 1)
+        log_fn = logger.warning if sep_frac >= 0.05 else logger.info
+        log_fn(
+            "GLM separation detected at %d / %d sites (%.1f%%); "
+            "NaN'd for dispersion + p-value computation.",
+            n_separated,
+            n_sites,
+            100.0 * sep_frac,
+        )
+
+    # P1-5: log non-convergence separately from separation. Non-converged
+    # sites emit unreliable statistics (the iterate just before divergence);
+    # mask them and warn the user when the fraction exceeds 1% so they can
+    # increase max_iter or diagnose a degenerate design matrix.
+    # Only count sites that are non-converged but NOT already flagged as
+    # separated (separated sites are a subset of unreliable sites and are
+    # reported above).
+    n_nonconverged_only = int((site_nonconverged & ~site_separated & valid).sum())
+    if n_nonconverged_only > 0:
+        nonconv_frac = n_nonconverged_only / max(n_sites, 1)
+        if nonconv_frac > 0.01:
+            logger.warning(
+                "IRLS non-convergence at %d / %d sites (%.1f%%); their Wald "
+                "statistics are NaN-masked. Consider increasing max_iter or "
+                "checking design matrix rank.",
+                n_nonconverged_only,
+                n_sites,
+                100.0 * nonconv_frac,
+            )
+        else:
+            logger.info(
+                "IRLS non-convergence at %d / %d sites (%.1f%%); NaN-masked.",
+                n_nonconverged_only,
+                n_sites,
+                100.0 * nonconv_frac,
+            )
+
+    if return_cov:
+        return beta, se_beta, deviance, pearson_chi2, n_eff, cov_beta
+    return beta, se_beta, deviance, pearson_chi2, n_eff
+
+
+def _solve_weighted_lsq(
+    X: np.ndarray,
+    z: np.ndarray,
+    w: np.ndarray,
+) -> np.ndarray:
+    """Batched solve of (X' W_i X) beta_i = X' W_i z_i across sites i.
+
+    X is (n_samples, p), z and w are (n_sites, n_samples).
+    Returns (n_sites, p). Sites with a singular X' W X get NaN.
+    """
+    # X' W_i X : (n_sites, p, p)
+    XtWX = np.einsum("jp,ij,jq->ipq", X, w, X)
+    # X' W_i z_i : (n_sites, p)
+    XtWz = np.einsum("jp,ij,ij->ip", X, w, z)
+
+    return _solve_stacked_systems(XtWX, XtWz[..., None])[..., 0]
+
+
+def _estimable_sites(X: np.ndarray, has_cov: np.ndarray) -> np.ndarray:
+    """Classify each distinct covered-row design once, before weighting."""
+    p = X.shape[1]
+    complete = has_cov.all(axis=1)
+    result = np.zeros(len(has_cov), dtype=bool)
+    result[complete] = np.linalg.matrix_rank(X) == p
+    partial = np.flatnonzero(~complete)
+    if len(partial):
+        patterns, inverse = np.unique(has_cov[partial], axis=0, return_inverse=True)
+        ranks = np.zeros(len(patterns), dtype=bool)
+        for i, mask in enumerate(patterns):
+            if mask.sum() >= p:
+                # NumPy's default SVD tolerance is eps*max(shape)*largest singular value.
+                ranks[i] = np.linalg.matrix_rank(X[mask]) == p
+        result[partial] = ranks[inverse]
+    return result
+
+
+def _solve_stacked_systems(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """Solve finite stacks, bisecting singular batches down to failed rows.
+
+    Chunking limits temporary allocations; one bad site does not cause scalar
+    dispatch for every other site. No ridge or pseudoinverse changes the model.
+    """
+    result = np.full(B.shape, np.nan, dtype=np.float64)
+    finite = np.flatnonzero(np.isfinite(A).all(axis=(1, 2)) & np.isfinite(B).all(axis=(1, 2)))
+
+    def solve(indices):
+        try:
+            values = np.linalg.solve(A[indices], B[indices])
+            good = np.isfinite(values).all(axis=(1, 2))
+            result[indices[good]] = values[good]
+        except np.linalg.LinAlgError:
+            if len(indices) > 1:
+                middle = len(indices) // 2
+                solve(indices[:middle])
+                solve(indices[middle:])
+
+    for start in range(0, len(finite), 8192):
+        solve(finite[start:start + 8192])
+    return result
+
+
+# Dispersion + reference-distribution helpers (shared with _score_finalize)
+
+
+def compute_dispersion_phi(
+    pearson_per_site: np.ndarray,
+    df_per_site: np.ndarray,
+    dispersion: str = "site",
+    min_dispersion: float = 1.0,
+    shrink_pseudo_df: float = 4.0,
+    min_disp_sites: int = 100,
+    chrom_name: str = "?",
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """McCullagh-Nelder dispersion in the four modes used elsewhere.
+
+    Parameters
+    ----------
+    pearson_per_site
+        Per-site Pearson chi-sq from the full-model fit (n_sites,).
+    df_per_site
+        Per-site residual degrees of freedom (n_obs_i - p_full), n_sites.
+    dispersion
+        ``"site"`` (default): per-site phi_i = pearson_i / df_i.
+        ``"chrom"``: single chromosome-pooled phi.
+        ``"shrink"``: James-Stein-style weighted average of per-site and
+        chromosome estimates.
+        ``"eb"``: empirical-Bayes shrinkage with data-driven weight.
+    min_dispersion
+        Clamp on phi (default 1.0). Underdispersion (phi < 1) usually
+        reflects model misspecification rather than truly less-than-
+        binomial variability; clamping at 1 is the conservative choice.
+
+    Returns
+    -------
+    phi_eff
+        (n_sites,) per-site dispersion used by the test
+    phi_hat
+        scalar chromosome-pooled phi (logged / returned for audit)
+    df_phi
+        (n_sites,) effective df backing each phi estimate. This is the
+        correct dfd for the F-reference in ``reference_pvalues``:
+          * "site":  df_per_site (per-site residual df)
+          * "chrom": chrom-pooled df (often >> 1e5 ~= chi^2(1))
+          * "shrink"/"eb": df_per_site + shrink weight (~= 8 at typical n=3+3)
+        Using df_per_site for the pooled modes was a pre-fix bug that
+        crushed every p-value because F(1, 4) is much more conservative
+        than F(1, 1e5) ~= chi^2(1) at typical test statistics.
+    """
+    if dispersion not in {"site", "chrom", "shrink", "eb"}:
+        raise ValueError(
+            f"dispersion must be 'site', 'chrom', 'shrink', or 'eb'; got {dispersion!r}"
+        )
+
+    usable = (df_per_site > 0) & np.isfinite(pearson_per_site)
+    n_usable = int(usable.sum())
+
+    if n_usable < min_disp_sites:
+        phi_hat = float(min_dispersion)
+        phi_raw = float(min_dispersion)
+        df_chrom = 1.0
+        if dispersion == "chrom":
+            logger.warning(
+                "%s: only %d sites usable for dispersion estimation; falling back to phi = %.2f.",
+                chrom_name,
+                n_usable,
+                min_dispersion,
+            )
+    else:
+        pearson_sum = float(pearson_per_site[usable].sum())
+        df_sum = float(df_per_site[usable].sum())
+        df_sum = max(df_sum, 1.0)
+        df_chrom = df_sum
+        phi_raw = pearson_sum / df_sum
+        phi_hat = float(max(min_dispersion, phi_raw))
+        logger.info(
+            "%s: chrom-pooled phi = %.3f (raw %.3f, %d sites, df=%s); dispersion='%s'",
+            chrom_name,
+            phi_hat,
+            phi_raw,
+            n_usable,
+            f"{int(df_chrom):,}",
+            dispersion,
+        )
+
+    df_safe = np.where(df_per_site > 0, df_per_site, 1.0)
+
+    if dispersion == "chrom":
+        phi_eff = np.full(pearson_per_site.shape, phi_hat, dtype=np.float64)
+        df_phi = np.full(pearson_per_site.shape, df_chrom, dtype=np.float64)
+        return phi_eff, phi_hat, df_phi
+
+    # site / shrink / eb: per-site estimate (or weighted average involving it)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        phi_site = pearson_per_site / df_safe
+    phi_site = np.where(usable, phi_site, min_dispersion)
+    phi_site = np.maximum(phi_site, min_dispersion)
+
+    if dispersion == "site":
+        # Per-site phi is estimated from this site's df_per_site Pearson sum.
+        return phi_site, phi_hat, df_safe.astype(np.float64).copy()
+
+    if dispersion == "eb":
+        from .dmc import _smyth_eb_moderation
+
+        phi_eff, df_phi, w_eb, phi_eb_hat = _smyth_eb_moderation(
+            pearson_per_site,
+            df_safe,
+            usable,
+            min_dispersion=min_dispersion,
+            min_disp_sites=min_disp_sites,
+        )
+        logger.info(
+            "%s: Smyth log-F EB moderation d0=%.2f, phi0=%.3f over %d sites.",
+            chrom_name,
+            w_eb,
+            phi_eb_hat,
+            int(np.sum(usable)),
+        )
+        return phi_eff, phi_eb_hat, df_phi
+
+    # shrink
+    w = float(shrink_pseudo_df)
+    num = df_safe * phi_site + w * phi_hat
+    den = df_safe + w
+    phi_eff = np.maximum(num / den, min_dispersion)
+    phi_eff = np.where(usable, phi_eff, phi_hat)
+    df_phi = np.where(usable, df_safe + w, df_chrom).astype(np.float64)
+    return phi_eff, phi_hat, df_phi
+
+
+def _f_survival(stat, dfn, dfd):
+    """F survival function including the infinite-denominator-df limit."""
+    from scipy import stats as sp_stats
+
+    dfd = np.asarray(dfd, dtype=float)
+    return np.where(
+        np.isposinf(dfd),
+        sp_stats.chi2.sf(np.asarray(stat) * dfn, df=dfn),
+        sp_stats.f.sf(stat, dfn=dfn, dfd=dfd),
+    )
+
+
+def reference_pvalues(
+    stat: np.ndarray,
+    phi_eff: np.ndarray,
+    df_resid: np.ndarray,
+    reference: str = "adaptive",
+    df_floor: float = 0.0,
+) -> np.ndarray:
+    """Convert a (already dispersion-corrected) chi-sq statistic to p-values.
+
+    ``reference="adaptive"`` (default) switches per-site between
+    ``F(1, df_resid)`` where ``phi_eff > 1`` (real overdispersion signal)
+    and ``chi2(1)`` where ``phi_eff`` was clamped to 1 -- the right
+    behaviour for quasi-binomial GLMs whose dispersion estimate is noisy
+    at small samples. ``"F"`` and ``"chi2"`` force a single reference
+    distribution regardless of per-site dispersion.
+
+    ``df_floor`` (default 0 = no floor) lower-bounds the F-reference
+    denominator df via ``max(df_resid, df_floor)``. The ``lr`` engine floors
+    this at ``DF_PHI_FLOOR`` (50) because ``F(1, ~4)`` is ~250x more
+    conservative than ``chi2(1)`` at typical statistics; the GLM callers
+    pass the same floor so ``glm`` is not systematically more conservative
+    than ``lr`` on identical data (M4).
+    """
+    if reference == "methylkit":
+        raise ValueError("reference='methylkit' was renamed to 'adaptive' in this release.")
+    if reference not in {"adaptive", "F", "chi2"}:
+        raise ValueError(f"reference must be 'adaptive', 'F', or 'chi2'; got {reference!r}")
+    from scipy import stats as sp_stats
+
+    df_eff = np.maximum(df_resid, df_floor) if df_floor else df_resid
+
+    if reference == "adaptive":
+        p_F = _f_survival(stat, 1, df_eff)
+        p_chi2 = sp_stats.chi2.sf(stat, df=1)
+        return np.where(phi_eff > 1.0, p_F, p_chi2)
+    if reference == "F":
+        return _f_survival(stat, 1, df_eff)
+    return sp_stats.chi2.sf(stat, df=1)
+
+
+# Contrast / Wald-test helpers -- used by tl.dmc(formula=..., contrast=...)
+
+
+def resolve_contrast(
+    contrast,
+    term_names: Sequence[str],
+    design_info=None,
+) -> tuple[np.ndarray, str]:
+    """Build a contrast matrix C of shape (k, p) from a flexible spec.
+
+    Accepted forms:
+
+    * ``contrast=str`` naming a single column in ``term_names`` -- produces a
+      1xp contrast vector selecting that coefficient (e.g. ``"age"`` for a
+      continuous covariate primary effect).
+    * ``contrast=str`` naming a factor (no exact column match) -- every term
+      whose name starts with ``"<factor>["`` is included (patsy treatment-
+      coded dummies). Returns a kxp contrast for a joint F-test.
+    * ``contrast=str`` containing ``"="`` or arithmetic operators (``+``,
+      ``-``, ``*``) -- passed to patsy ``DesignInfo.linear_constraint`` for
+      named linear contrasts like ``"group[T.KO] - group[T.WT]"``.
+      Requires ``design_info`` to be supplied.
+    * ``contrast=np.ndarray`` shape (k, p) -- used verbatim.
+
+    Returns ``(C, label)`` where ``label`` describes the contrast for
+    provenance.
+    """
+    p = len(term_names)
+    if isinstance(contrast, np.ndarray):
+        C = np.atleast_2d(contrast).astype(np.float64)
+        if C.shape[1] != p:
+            raise ValueError(f"Contrast matrix has {C.shape[1]} columns but design has p={p}")
+        return C, f"matrix[{C.shape[0]}x{C.shape[1]}]"
+
+    if not isinstance(contrast, str):
+        raise TypeError(f"contrast must be str or np.ndarray; got {type(contrast).__name__}")
+
+    # Exact column match -- single-row contrast selecting that coefficient
+    if contrast in term_names:
+        col = term_names.index(contrast)
+        C = np.zeros((1, p), dtype=np.float64)
+        C[0, col] = 1.0
+        return C, contrast
+
+    # Linear-constraint expression -- delegate to patsy
+    expr_chars = set("=+-*")
+    if any(c in contrast for c in expr_chars) and design_info is not None:
+        try:
+            constraint = design_info.linear_constraint(contrast)
+        except Exception as exc:
+            raise ValueError(f"Could not parse contrast {contrast!r} with patsy: {exc}") from exc
+        C = np.asarray(constraint.coefs, dtype=np.float64)
+        if C.ndim == 1:
+            C = C[None, :]
+        if C.shape[1] != p:
+            raise ValueError(
+                f"patsy returned contrast with {C.shape[1]} columns but design has p={p}"
+            )
+        return C, contrast
+
+    # Factor name -- collect every term beginning with "<factor>["
+    # Also match C(factor, ...)[...] terms produced when reference_level wraps
+    # the factor column with a Treatment(...) coding spec.
+    factor_terms = [
+        (i, t)
+        for i, t in enumerate(term_names)
+        if t.startswith(f"{contrast}[")
+        or t == f"C({contrast})"
+        or t.startswith(f"C({contrast})[")
+        or t.startswith(f"C({contrast},")
+    ]
+    if not factor_terms:
+        raise ValueError(
+            f"Could not resolve contrast {contrast!r} against design columns "
+            f"{term_names}. Either use an exact column name, a factor name "
+            "that appears as treatment-coded dummies, or a patsy "
+            "linear-combination expression like 'group[T.A] - group[T.B]'."
+        )
+    C = np.zeros((len(factor_terms), p), dtype=np.float64)
+    for row, (col, _) in enumerate(factor_terms):
+        C[row, col] = 1.0
+    return C, contrast
+
+
+def wald_test(
+    beta: np.ndarray,
+    cov_beta: np.ndarray,
+    C: np.ndarray,
+    phi_eff: np.ndarray | None = None,
+    df_resid: np.ndarray | None = None,
+    reference: str = "adaptive",
+    df_floor: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.signedinteger]:
+    """Per-site Wald / joint-F test of H0: C*beta_i = 0.
+
+    Parameters
+    ----------
+    beta            (n_sites, p)             fitted coefficients
+    cov_beta        (n_sites, p, p)          parameter covariance matrix
+    C               (k, p)                   contrast matrix
+    phi_eff         (n_sites,) or None       per-site dispersion to scale
+                                             cov_beta by (quasi-binomial).
+                                             None -> no scaling (binomial).
+    df_resid        (n_sites,) or None       per-site residual df for the F
+                                             reference distribution. None ->
+                                             chi^2 reference.
+    reference       {"adaptive","F","chi2"}  How to convert stat -> p-value.
+                                             ``"adaptive"`` switches per-site:
+                                             F where phi_eff>1, chi^2 where
+                                             phi_eff was clamped. ``"chi2"``
+                                             forces chi^2. ``"F"`` forces F.
+
+    Returns
+    -------
+    stat            (n_sites,)               F-statistic / k (or chi^2/k);
+                                             reduces to Wald-z^2 at k=1.
+    pvalue          (n_sites,)               two-sided p-value
+    k               int                      contrast rank (df1)
+
+    Implementation notes
+    --------------------
+    For a single-row contrast (k=1), Wald^2 = (Cbeta)^2/Var(Cbeta) is chi^2(1) under
+    H0. For multi-row contrasts (k>1), the joint Wald statistic is
+    (Cbeta)T[CSigmaCT]^-^1(Cbeta); divided by k it follows F(k, df_resid). When phi_eff
+    is supplied, cov_beta is scaled by phi (quasi-binomial). When df_resid
+    is None we use chi^2(k)/k as the reference.
+    """
+    from scipy import stats as sp_stats
+
+    beta = np.asarray(beta, dtype=np.float64)
+    cov_beta = np.asarray(cov_beta, dtype=np.float64)
+    C = np.atleast_2d(np.asarray(C, dtype=np.float64))
+    n_sites, p = beta.shape
+    k = C.shape[0]
+    if C.shape[1] != p:
+        raise ValueError(f"Contrast has {C.shape[1]} columns but beta has p={p}")
+    if cov_beta.shape != (n_sites, p, p):
+        raise ValueError(f"cov_beta shape {cov_beta.shape} != (n_sites={n_sites}, p={p}, p={p})")
+
+    # Cbeta -- shape (n_sites, k)
+    Cb = beta @ C.T
+
+    # C Sigma CT -- shape (n_sites, k, k). When phi_eff is supplied we scale here.
+    if phi_eff is not None:
+        scale = np.asarray(phi_eff, dtype=np.float64)
+        cov_scaled = cov_beta * scale[:, None, None]
+    else:
+        cov_scaled = cov_beta
+    CSCt = np.einsum("kp,ipq,lq->ikl", C, cov_scaled, C)
+
+    stat = np.full(n_sites, np.nan, dtype=np.float64)
+    finite = np.isfinite(Cb).all(axis=1) & np.isfinite(CSCt).reshape(n_sites, -1).all(axis=1)
+    if k == 1:
+        var = CSCt[:, 0, 0]
+        good = finite & (var > 0)
+        stat[good] = (Cb[good, 0] ** 2) / var[good]
+    else:
+        try:
+            inv_block = np.linalg.inv(CSCt[finite])
+            stat[finite] = np.einsum("ij,ijk,ik->i", Cb[finite], inv_block, Cb[finite])
+        except np.linalg.LinAlgError:
+            for i in np.where(finite)[0]:
+                try:
+                    inv_i = np.linalg.inv(CSCt[i])
+                    stat[i] = Cb[i] @ inv_i @ Cb[i]
+                except np.linalg.LinAlgError:
+                    pass
+
+    # Reference distribution -> p-value. df_floor lower-bounds the F
+    # denominator df (the GLM callers pass DF_PHI_FLOOR so glm matches lr;
+    # see reference_pvalues for the rationale -- M4).
+    df_eff = np.maximum(df_resid, df_floor) if (df_resid is not None and df_floor) else df_resid
+    if df_resid is None or reference == "chi2":
+        pvalue = sp_stats.chi2.sf(stat, df=k)
+    elif reference == "F":
+        f_stat = stat / k
+        pvalue = _f_survival(f_stat, k, df_eff)
+    else:  # adaptive: per-site switch between F and chi2
+        f_stat = stat / k
+        p_F = _f_survival(f_stat, k, df_eff)
+        p_chi2 = sp_stats.chi2.sf(stat, df=k)
+        if phi_eff is None:
+            pvalue = p_chi2
+        else:
+            pvalue = np.where(np.asarray(phi_eff) > 1.0, p_F, p_chi2)
+
+    return stat, pvalue, np.int32(k)
+
+
+def delta_method_meth_diff_ci(
+    coef: np.ndarray,
+    coef_se: np.ndarray,
+    ref_eta: np.ndarray | None = None,
+    alpha: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Delta-method CI on the meth-scale difference Deltabeta from a logit-scale Wald CI.
+
+    For a single binary-treatment coefficient, Deltaeta = coef and the meth-scale
+    difference is Deltabeta ~= expit(eta_ref + coef) - expit(eta_ref). At the reference
+    fitted mean eta_ref, the local Jacobian of the inverse link is
+    ``dbeta/deta = expit(eta)*(1 - expit(eta))``. The Wald CI on coef is mapped to
+    the beta scale by ``Deltabeta +/- z * |J(eta_ref)| * SE(coef)``, clamped to [-1, 1].
+
+    Parameters
+    ----------
+    coef       (n_sites,) treatment coefficient on logit scale
+    coef_se    (n_sites,) Wald SE of that coefficient
+    ref_eta    (n_sites,) reference linear predictor (e.g. control-group
+               fitted eta). When None we use ``eta_ref = 0``, the maximum-
+               Jacobian point ``J(0) = 0.25``; this is the most conservative
+               (widest) bound.
+    alpha      Significance level (default 0.05 -> 95% CI).
+
+    Returns
+    -------
+    (ci_lo, ci_hi) -- float64 arrays of shape (n_sites,), clamped to [-1, 1].
+    """
+    from scipy import stats as sp_stats
+
+    z = float(sp_stats.norm.isf(alpha / 2.0))
+    coef = np.asarray(coef, dtype=np.float64)
+    coef_se = np.asarray(coef_se, dtype=np.float64)
+    if ref_eta is None:
+        # J(0) = 0.25
+        jac = np.full_like(coef, 0.25)
+    else:
+        ref_eta = np.asarray(ref_eta, dtype=np.float64)
+        # expit, bounded
+        with np.errstate(over="ignore", under="ignore"):
+            p_ref = 1.0 / (1.0 + np.exp(-np.clip(ref_eta, -30.0, 30.0)))
+        jac = p_ref * (1.0 - p_ref)
+    # meth-scale Deltabeta at the reference (single binary coefficient case): use
+    # expit(eta+coef) - expit(eta) for the central estimate (more accurate than
+    # the linearisation), but use jac * coef_se for the half-width.
+    if ref_eta is None:
+        eta_ref = np.zeros_like(coef)
+    else:
+        eta_ref = np.clip(np.asarray(ref_eta, dtype=np.float64), -30.0, 30.0)
+    with np.errstate(over="ignore", under="ignore"):
+        p_treat = 1.0 / (1.0 + np.exp(-np.clip(eta_ref + coef, -30.0, 30.0)))
+        p_ref_arr = 1.0 / (1.0 + np.exp(-eta_ref))
+    diff = p_treat - p_ref_arr
+    half = z * jac * coef_se
+    lo = np.clip(diff - half, -1.0, 1.0)
+    hi = np.clip(diff + half, -1.0, 1.0)
+    return lo, hi
+
+
+def welch_meth_diff_ci(
+    mean_case: np.ndarray,
+    var_mean_case: np.ndarray,
+    mean_ctrl: np.ndarray,
+    var_mean_ctrl: np.ndarray,
+    alpha: float = 0.05,
+    dof: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """CI on Deltabeta from per-group Welford accumulators.
+
+    ``var_mean_*`` is the variance OF THE MEAN (= s^2 / n), so the SE of the
+    difference is ``sqrt(var_mean_case + var_mean_ctrl)``. CI clamped to
+    [-1, 1].
+
+    ``dof`` (the Welch-Satterthwaite degrees of freedom, per site) makes the
+    interval use the ``t(dof)`` critical value that the welch_t **p-value**
+    uses (``t.sf(|t|, dof)``). Without it the interval falls back to the
+    normal quantile ``z=1.96``, which at n=3 (dof~4, t_.025=2.78) is ~30%
+    too narrow relative to its own test -- a CI/test disagreement (M13).
+    ``dof=None`` preserves the legacy normal interval.
+    """
+    from scipy import stats as sp_stats
+
+    if dof is None:
+        crit: np.ndarray | float = float(sp_stats.norm.isf(alpha / 2.0))
+    else:
+        crit = sp_stats.t.isf(alpha / 2.0, np.maximum(np.asarray(dof, dtype=np.float64), 1.0))
+    se = np.sqrt(np.maximum(var_mean_case + var_mean_ctrl, 0.0))
+    diff = mean_case - mean_ctrl
+    lo = np.clip(diff - crit * se, -1.0, 1.0)
+    hi = np.clip(diff + crit * se, -1.0, 1.0)
+    return lo, hi
+
+
+def newcombe_diff_ci(
+    meth_a: np.ndarray,
+    cov_a: np.ndarray,
+    meth_b: np.ndarray,
+    cov_b: np.ndarray,
+    alpha: float = 0.05,
+    *,
+    phi: np.ndarray | None = None,
+    df: np.ndarray | None = None,
+    phi_a: np.ndarray | None = None,
+    phi_b: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Newcombe (1998) hybrid Wilson-score CI for pi_a - pi_b on POOLED counts.
+
+    Used by the binomial-pool tests (lr, fisher) where no per-replicate
+    variance is accumulated. Uses Wilson-score CIs on each
+    pooled proportion, then combines them per Newcombe method 10.
+
+    Overdispersion (``phi`` / ``df``)
+    ---------------------------------
+    The quasi-binomial ``lr`` test divides its statistic by a per-site
+    McCullagh-Nelder dispersion ``phi`` and references F(1, df) / chi^2(1).
+    Pass per-site ``phi`` (and ``df``, already floored by the caller with the
+    same ``DF_PHI_FLOOR`` the p-value uses) so this interval shares that
+    variance model rather than being an anti-conservatively narrow binomial
+    interval next to a dispersion-aware p-value: at sites with ``phi > 1``
+    each Wilson half-width is widened by ``sqrt(phi)`` and a t(df) tail
+    replaces the normal z; where ``phi`` was clamped to 1 (the quasi-binomial
+    collapses to a binomial) the normal z is used and the interval is
+    identical to the phi-free form. ``phi=None`` (the default, used by
+    ``fisher`` which has no dispersion estimate) reproduces the exact binomial
+    Newcombe interval -- byte-identical to the pre-phi behaviour.
+    """
+    from scipy import stats as sp_stats
+
+    z_norm = float(sp_stats.norm.isf(alpha / 2.0))
+    z_eff: np.ndarray | float
+    if phi is None:
+        z_eff = z_norm
+    else:
+        phi = np.asarray(phi, dtype=np.float64)
+        if df is None:
+            t_mult: np.ndarray | float = z_norm
+        else:
+            # df is expected pre-floored by the caller (DF_PHI_FLOOR); the
+            # max(., 1) is a numerical guard only.
+            df = np.asarray(df, dtype=np.float64)
+            t_mult = sp_stats.t.isf(alpha / 2.0, np.maximum(df, 1.0))
+        # Mirror the adaptive p-value: inflate by sqrt(phi) with a t(df) tail
+        # only where there is genuine overdispersion (phi > 1); fall back to
+        # the binomial normal interval where phi was clamped to 1.
+        z_eff = np.sqrt(np.maximum(phi,1.0)) * t_mult
+
+    def _wilson(m, n, group_phi=None):
+        m = m.astype(np.float64)
+        n = n.astype(np.float64)
+        z = z_eff  # scalar (fisher) or per-site array (lr); broadcasts on n
+        if group_phi is not None:
+            multiplier = z_norm if df is None else sp_stats.t.isf(alpha/2, np.maximum(df,1.))
+            z = np.sqrt(np.maximum(group_phi,1.)) * multiplier
+        with np.errstate(invalid="ignore", divide="ignore"):
+            p_hat = np.where(n > 0, m / n, np.nan)
+            denom = 1.0 + (z * z) / np.maximum(n, 1e-12)
+            centre = (p_hat + (z * z) / (2.0 * np.maximum(n, 1e-12))) / denom
+            half = (
+                z
+                * np.sqrt(
+                    np.maximum(
+                        p_hat * (1.0 - p_hat) / np.maximum(n, 1e-12)
+                        + (z * z) / (4.0 * np.maximum(n, 1e-12) ** 2),
+                        0.0,
+                    )
+                )
+                / denom
+            )
+            lo = np.clip(centre - half, 0.0, 1.0)
+            hi = np.clip(centre + half, 0.0, 1.0)
+        return p_hat, lo, hi
+
+    p_a, l_a, u_a = _wilson(np.asarray(meth_a), np.asarray(cov_a), phi_a)
+    p_b, l_b, u_b = _wilson(np.asarray(meth_b), np.asarray(cov_b), phi_b)
+    diff = p_a - p_b
+    lo = diff - np.sqrt(np.maximum((p_a - l_a) ** 2 + (u_b - p_b) ** 2, 0.0))
+    hi = diff + np.sqrt(np.maximum((u_a - p_a) ** 2 + (p_b - l_b) ** 2, 0.0))
+    lo = np.clip(lo, -1.0, 1.0)
+    hi = np.clip(hi, -1.0, 1.0)
+    return lo, hi
