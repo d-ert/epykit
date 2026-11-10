@@ -1,0 +1,166 @@
+"""epykit: Parquet methylation pipeline (Bismark ingestion -> DMR annotation)
+
+This package provides a complete WGBS analysis pipeline:
+
+  - convert:   Bismark .cov -> partitioned Parquet methylstore
+  - filter:    QC / coverage filtering / site intersection
+  - dmc:       Differential methylation calling per CpG. Default test is
+               ``lr`` (quasi-binomial likelihood-ratio with McCullagh-
+               Nelder dispersion). Other backends: welch_t, fisher, glm.
+  - dmr:       DMR calling (regional_gls default, with chain-merge, tile,
+               sliding-window and rule-segmentation alternatives) and
+               Gaussian-kernel methylation smoothing
+  - annotate:  Gene-feature and CpG-island context annotation
+  - qc:        Bisulfite conversion rate, global methylation, coverage
+               uniformity, plus opt-in clinical / cohort checks
+
+DMC engine choice
+-----------------
+Bare ``lr`` is the recommended default and the engine the benchmark paper
+characterises. ``welch_t``, ``fisher`` and ``glm`` are alternative
+engines for specific situations (small samples, single replicates,
+covariate-adjusted designs). See ``docs/architecture.md`` for details.
+
+Logging convention
+------------------
+Library modules (everything under ``epykit.*`` except ``epykit.cli``) emit
+progress and diagnostics through the standard :mod:`logging` module via
+``logger = logging.getLogger(__name__)`` -- they never call :func:`print`.
+The CLI entry point (``epykit.cli``) reserves :func:`print` for the
+final user-facing result lines on stdout; structured progress logs flow
+through the same logging hierarchy and are controlled via ``-v`` / ``-q``.
+This split lets host applications and notebooks consume epykit without
+having their stdout polluted, while CLI users see the expected output.
+"""
+
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _v
+
+try:
+    __version__ = _v("epykit")
+except PackageNotFoundError:
+    # editable install or running from source without install
+    __version__ = "0.0.0+unknown"
+
+from . import pl, pp, query, tl
+from ._config import get_tmp_dir, set_tmp_dir
+from ._dmc_store import DMCStore
+from ._glm import build_design
+from .annotate import (
+    HOMER_FEATURES,
+    annotate_cpg_islands,
+    annotate_features,
+)
+from .convert import convert_sample
+from .dmr import (
+    DMR_PRESETS,
+    call_dmr_chain_merge,
+    call_dmr_sliding_window,
+    smooth_methylation_bsmooth,
+    smooth_methylation_gaussian,
+)
+
+# Export (lazy heavy deps inside)
+from .export import dmcs_to_bed, dmrs_to_bed, export_tables, to_bedgraph, to_bigwig
+from .io import (
+    load,
+    read_bismark,
+    read_combined_strand_bed,
+    read_methyldackel,
+    read_nfcore_methylseq,
+)
+from .methyldata import MethylData
+from .qc import (
+    bisulfite_conversion_rate,
+    contamination_estimate,
+    coverage_uniformity,
+    global_methylation_report,
+    sex_check,
+)
+from .qc import (
+    power as power_calc,
+)
+from .qc import (
+    sample_correlation as sample_correlation_qc,
+)
+from .report import generate_report
+
+__all__ = [
+    "DMR_PRESETS",
+    "HOMER_FEATURES",
+    # DMCStore is the streaming-store handle returned by tl.dmc(..., return_store=True).
+    # The lower-level dmc engine functions (process_chromosomes_dmc, apply_multiple_testing_correction,
+    # empirical_fdr_for_dmc, fisher_exact_vectorized, shrink_meth_diff) moved to
+    # epykit.dmc submodule in 1.0. Import them via `from epykit.dmc import ...`.
+    "DMCStore",
+    "MethylData",
+    "__version__",
+    "annotate_cpg_islands",
+    "annotate_features",
+    "bisulfite_conversion_rate",
+    "build_design",
+    "call_dmr_chain_merge",
+    "call_dmr_sliding_window",
+    "contamination_estimate",
+    "convert_sample",
+    "coverage_uniformity",
+    "dmcs_to_bed",
+    "dmrs_to_bed",
+    "export_tables",
+    "generate_report",
+    "get_tmp_dir",
+    "global_methylation_report",
+    "load",
+    "pl",
+    "power_calc",
+    "pp",
+    "query",
+    "read_bismark",
+    "read_combined_strand_bed",
+    "read_methyldackel",
+    "read_nfcore_methylseq",
+    "sample_correlation_qc",
+    "set_tmp_dir",
+    "sex_check",
+    "smooth_methylation_bsmooth",
+    "smooth_methylation_gaussian",
+    "tl",
+    "to_bedgraph",
+    "to_bigwig",
+]
+
+# --- Deprecation shim for demoted top-level names (1.0; kept until a future major release) ---
+_DEMOTED_TO_DMC = frozenset(
+    {
+        "process_chromosomes_dmc",
+        "apply_multiple_testing_correction",
+        "empirical_fdr_for_dmc",
+        "fisher_exact_vectorized",
+        "shrink_meth_diff",
+    }
+)
+
+
+def __getattr__(name: str):
+    """Module-level __getattr__ provides backward compat for names removed
+    from `__all__` at 1.0.
+
+    Returns the function from the appropriate submodule and emits
+    DeprecationWarning pointing users at the new import path. The shim is
+    retained in 1.2 and scheduled for removal in a future major release.
+    """
+    if name in _DEMOTED_TO_DMC:
+        import warnings
+
+        from . import dmc as _dmc_mod
+
+        warnings.warn(
+            f"epykit.{name} is no longer a top-level export; use "
+            f"`from epykit.dmc import {name}` instead, or use the "
+            f"recommended `epykit.tl.dmc` wrapper. This shim will be "
+            f"removed in a future major release of epykit.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return getattr(_dmc_mod, name)
+    raise AttributeError(f"module 'epykit' has no attribute {name!r}")
